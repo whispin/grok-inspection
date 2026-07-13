@@ -82,6 +82,10 @@ Restart CPA and open:
 The resource page asks for the CPA Management Key before calling authenticated
 Management API routes. The key is stored only in browser local storage.
 
+Disable/enable/delete actions reuse the same Management Key from the page
+request Authorization header. Environment variables `MANAGEMENT_PASSWORD` or
+`CPA_MANAGEMENT_KEY` remain optional fallbacks for headless container setups.
+
 ## Management API
 
 All routes below require CPA Management API authentication:

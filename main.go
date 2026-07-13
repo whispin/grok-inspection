@@ -12,7 +12,7 @@ import (
 
 const (
 	pluginName            = "grok-inspection"
-	pluginVersion         = "0.1.1"
+	pluginVersion         = "0.1.2"
 	resourceContentType   = "text/html; charset=utf-8"
 	jsonContentType       = "application/json; charset=utf-8"
 	managementRoutePrefix = "/plugins/" + pluginName
@@ -112,7 +112,8 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		if len(req.Body) > 0 {
 			_ = json.Unmarshal(req.Body, &body)
 		}
-		result, errApply := engine.applyRecommendations(body.AuthIndexes)
+		password := resolveManagementPassword(req.Headers)
+		result, errApply := engine.applyRecommendations(body.AuthIndexes, password, req.Headers)
 		if errApply != nil {
 			return jsonResponse(http.StatusConflict, map[string]any{"error": errApply.Error()})
 		}
@@ -128,11 +129,12 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		if name == "" {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "name or auth_index required"})
 		}
+		password := resolveManagementPassword(req.Headers)
 		var errAction error
 		if body.Delete {
-			errAction = deleteAuthFile(name)
+			errAction = deleteAuthFile(name, password, req.Headers)
 		} else {
-			errAction = setAuthDisabled(name, body.Disabled)
+			errAction = setAuthDisabled(name, body.Disabled, password, req.Headers)
 		}
 		if errAction != nil {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": errAction.Error()})

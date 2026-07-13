@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -524,12 +525,93 @@ func cpaManagementPassword() string {
 	return firstNonEmpty(os.Getenv("MANAGEMENT_PASSWORD"), os.Getenv("CPA_MANAGEMENT_KEY"))
 }
 
+func extractBearerToken(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	// http.Header.Get is case-insensitive for canonical keys.
+	auth := strings.TrimSpace(headers.Get("Authorization"))
+	if auth == "" {
+		// JSON-decoded headers from the host may preserve non-canonical keys.
+		for key, values := range headers {
+			if strings.EqualFold(strings.TrimSpace(key), "Authorization") && len(values) > 0 {
+				auth = strings.TrimSpace(values[0])
+				break
+			}
+		}
+	}
+	if auth == "" {
+		return ""
+	}
+	const prefix = "bearer "
+	if len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+		return strings.TrimSpace(auth[len(prefix):])
+	}
+	return auth
+}
+
+func resolveManagementPassword(headers http.Header) string {
+	if headers == nil {
+		return strings.TrimSpace(cpaManagementPassword())
+	}
+	if token := extractBearerToken(headers); token != "" {
+		return token
+	}
+	if token := strings.TrimSpace(headers.Get("X-Management-Key")); token != "" {
+		return token
+	}
+	for key, values := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), "X-Management-Key") && len(values) > 0 {
+			if token := strings.TrimSpace(values[0]); token != "" {
+				return token
+			}
+		}
+	}
+	return strings.TrimSpace(cpaManagementPassword())
+}
+
+func resolveManagementBaseURL(headers http.Header) string {
+	if value := firstNonEmpty(os.Getenv("CPA_BASE_URL"), os.Getenv("CPA_MANAGEMENT_BASE_URL")); value != "" {
+		return strings.TrimRight(strings.TrimSpace(value), "/")
+	}
+	host := ""
+	if headers != nil {
+		host = strings.TrimSpace(headers.Get("X-Forwarded-Host"))
+		if host == "" {
+			host = strings.TrimSpace(headers.Get("Host"))
+		}
+		if host == "" {
+			for key, values := range headers {
+				if strings.EqualFold(strings.TrimSpace(key), "Host") && len(values) > 0 {
+					host = strings.TrimSpace(values[0])
+					break
+				}
+			}
+		}
+	}
+	if host != "" {
+		// Always call the local CPA process; reuse the inbound management port when available.
+		if _, port, err := net.SplitHostPort(host); err == nil && port != "" {
+			return "http://127.0.0.1:" + port
+		}
+	}
+	return strings.TrimRight(cpaManagementBaseURL, "/")
+}
+
 func callCPAManagement(method, path string, body []byte) (int, []byte, error) {
-	password := strings.TrimSpace(cpaManagementPassword())
+	return callCPAManagementWithAuth(method, path, body, "", nil)
+}
+
+func callCPAManagementWithAuth(method, path string, body []byte, password string, headers http.Header) (int, []byte, error) {
+	password = strings.TrimSpace(password)
+	if password == "" {
+		password = resolveManagementPassword(headers)
+	}
 	if password == "" {
 		return 0, nil, fmt.Errorf("CPA management password is unavailable")
 	}
-	req, errRequest := http.NewRequest(method, strings.TrimRight(cpaManagementBaseURL, "/")+path, bytes.NewReader(body))
+	baseURL := resolveManagementBaseURL(headers)
+	req, errRequest := http.NewRequest(method, strings.TrimRight(baseURL, "/")+path, bytes.NewReader(body))
 	if errRequest != nil {
 		return 0, nil, errRequest
 	}
@@ -588,7 +670,7 @@ func verifyAuthDisabled(authIndex, name string, disabled bool) error {
 	return fmt.Errorf("auth disappeared while verifying %s", name)
 }
 
-func setAuthDisabled(name string, disabled bool) error {
+func setAuthDisabled(name string, disabled bool, password string, headers http.Header) error {
 	target, errTarget := findAuthFile(name)
 	if errTarget != nil {
 		return errTarget
@@ -603,7 +685,7 @@ func setAuthDisabled(name string, disabled bool) error {
 	if errMarshal != nil {
 		return errMarshal
 	}
-	if _, _, errPatch := callCPAManagement(http.MethodPatch, "/v0/management/auth-files/status", body); errPatch != nil {
+	if _, _, errPatch := callCPAManagementWithAuth(http.MethodPatch, "/v0/management/auth-files/status", body, password, headers); errPatch != nil {
 		return errPatch
 	}
 	if errVerify := verifyAuthDisabled(target.AuthIndex, target.Name, disabled); errVerify != nil {
@@ -629,13 +711,13 @@ func setAuthDisabled(name string, disabled bool) error {
 	return nil
 }
 
-func deleteAuthFile(name string) error {
+func deleteAuthFile(name string, password string, headers http.Header) error {
 	target, errTarget := findAuthFile(name)
 	if errTarget != nil {
 		return errTarget
 	}
 	path := "/v0/management/auth-files?name=" + url.QueryEscape(target.Name)
-	if _, _, errDelete := callCPAManagement(http.MethodDelete, path, nil); errDelete != nil {
+	if _, _, errDelete := callCPAManagementWithAuth(http.MethodDelete, path, nil, password, headers); errDelete != nil {
 		return errDelete
 	}
 	list, errList := callHostAuthList()
@@ -659,7 +741,7 @@ func deleteAuthFile(name string) error {
 	return nil
 }
 
-func (e *inspectionEngine) applyRecommendations(indexes []string) (map[string]any, error) {
+func (e *inspectionEngine) applyRecommendations(indexes []string, password string, headers http.Header) (map[string]any, error) {
 	e.mu.Lock()
 	if e.running || e.applying {
 		e.mu.Unlock()
@@ -712,9 +794,9 @@ func (e *inspectionEngine) applyRecommendations(indexes []string) (map[string]an
 		targetName := firstNonEmpty(item.FileName, item.AuthIndex, item.Name)
 		var errAction error
 		if item.Action == "delete" {
-			errAction = deleteAuthFile(targetName)
+			errAction = deleteAuthFile(targetName, password, headers)
 		} else {
-			errAction = setAuthDisabled(targetName, item.Action == "disable")
+			errAction = setAuthDisabled(targetName, item.Action == "disable", password, headers)
 		}
 		if errAction != nil {
 			failures = append(failures, item.Name+": "+errAction.Error())

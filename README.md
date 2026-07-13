@@ -46,10 +46,13 @@ with a dotted version such as `v0.1.0`. The release workflow publishes:
 
 ```text
 grok-inspection_0.1.0_linux_amd64.zip
+grok-inspection_0.1.0_darwin_arm64.zip
+grok-inspection_0.1.0_windows_amd64.zip
 checksums.txt
 ```
 
-The zip contains `grok-inspection.so` at its root.
+Each zip contains the platform library at its root: `grok-inspection.so`,
+`grok-inspection.dylib`, or `grok-inspection.dll`.
 
 ## Install
 

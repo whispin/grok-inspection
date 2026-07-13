@@ -130,8 +130,11 @@ func renderUIPage(pluginID string) []byte {
       .grok-inspection-page .card { min-width:0; padding:10px; }
       .grok-inspection-page .card .v { font-size:26px; }
       .grok-inspection-page .bar { display:block; }
-      .grok-inspection-page .actions-row { margin-top:8px; width:100%%; }
-      .grok-inspection-page .actions-row > button { flex:1 1 auto; min-width:0; }
+      .grok-inspection-page .actions-row {
+        margin-top:8px; width:100%%; overflow-x:auto; flex-wrap:nowrap;
+        padding-bottom:4px; scrollbar-width:thin;
+      }
+      .grok-inspection-page .actions-row > button { flex:0 0 auto; min-width:0; }
       .grok-inspection-page .pager { align-items:stretch; }
       .grok-inspection-page .pager > div { width:100%%; }
       .grok-inspection-page .pager > div:last-child { justify-content:space-between; }

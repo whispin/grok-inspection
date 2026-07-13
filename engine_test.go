@@ -4,7 +4,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
+	"time"
+
+	"grok-inspection/cpasdk/pluginapi"
 )
 
 func TestCallCPAManagementUsesBearerPasswordAndJSON(t *testing.T) {
@@ -44,7 +48,6 @@ func TestCallCPAManagementUsesBearerPasswordAndJSON(t *testing.T) {
 		t.Fatalf("status = %d", status)
 	}
 }
-
 
 func TestResolveManagementPasswordPrefersRequestBearer(t *testing.T) {
 	oldPassword := os.Getenv("MANAGEMENT_PASSWORD")
@@ -120,4 +123,168 @@ func TestResolveManagementBaseURLIgnoresRequestHostPort(t *testing.T) {
 	if got := resolveManagementBaseURL(headers); got != "http://127.0.0.1:9999" {
 		t.Fatalf("env base url = %q", got)
 	}
+}
+
+func TestStartRejectsInvalidWorkers(t *testing.T) {
+	e := &inspectionEngine{workers: defaultWorkers}
+	err := e.start(startRequest{Workers: 99})
+	if err == nil || !strings.Contains(err.Error(), "workers must") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestIncrementalStartRequiresExistingResults(t *testing.T) {
+	e := &inspectionEngine{workers: defaultWorkers}
+	err := e.start(startRequest{Workers: 2, Incremental: true})
+	if err == nil || !strings.Contains(err.Error(), "增量巡检") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestStableIdentityPrefersAuthIndexNotEmail(t *testing.T) {
+	// Same email must NOT cause skip when auth_index differs (re-import new token).
+	known := knownResultKeys([]accountResult{
+		{AuthIndex: "old-ai", FileName: "a.json", Email: "same@x.com", Name: "same@x.com"},
+	})
+	// New runtime index, same email/name → not known
+	if entryIsKnown(known, pluginapi.HostAuthFileEntry{
+		AuthIndex: "new-ai",
+		Name:      "a.json",
+		Email:     "same@x.com",
+		Label:     "same@x.com",
+	}) {
+		t.Fatal("same email with different auth_index must not be treated as known")
+	}
+	// Same auth_index → known
+	if !entryIsKnown(known, pluginapi.HostAuthFileEntry{AuthIndex: "old-ai", Name: "other.json"}) {
+		t.Fatal("same auth_index should be known")
+	}
+	// No auth_index: file name+size+mtime must match
+	known2 := knownResultKeys([]accountResult{
+		{FileName: "b.json", FileSize: 10, FileModUnix: 100},
+	})
+	if !entryIsKnown(known2, pluginapi.HostAuthFileEntry{
+		Name:    "b.json",
+		Size:    10,
+		ModTime: time.Unix(100, 0),
+	}) {
+		t.Fatal("matching file fingerprint should be known")
+	}
+	if entryIsKnown(known2, pluginapi.HostAuthFileEntry{
+		Name:    "b.json",
+		Size:    11, // rewritten file
+		ModTime: time.Unix(100, 0),
+	}) {
+		t.Fatal("changed file size should force re-inspect")
+	}
+}
+
+func TestStartActionReturnsSeqAndReportsOnStatus(t *testing.T) {
+	old := engine
+	engine = &inspectionEngine{workers: defaultWorkers}
+	t.Cleanup(func() {
+		engine.runWG.Wait()
+		engine = old
+	})
+
+	// Missing password will fail delete quickly; still records recent_row_actions.
+	seq, action, err := engine.startAction(actionRequest{
+		Name:   "missing.json",
+		Delete: true,
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq == 0 || action != "delete" {
+		t.Fatalf("seq=%d action=%q", seq, action)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var found bool
+	for time.Now().Before(deadline) {
+		snap := engine.snapshot(false)
+		for _, a := range snap.RecentRowActions {
+			if a.Seq == seq {
+				found = true
+				if a.OK {
+					t.Fatal("expected failed action without management password")
+				}
+				if a.Error == "" {
+					t.Fatal("expected error text on failed action")
+				}
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("recent_row_actions never reported action_seq")
+	}
+}
+
+func TestDeleteAuthFilesBatchBuildsNamesBody(t *testing.T) {
+	// Smoke: empty input is a no-op.
+	if fails := deleteAuthFilesBatch(nil, "x", nil, false); len(fails) != 0 {
+		t.Fatalf("empty batch failures = %#v", fails)
+	}
+	// Missing file names should fail locally without calling management HTTP.
+	fails := deleteAuthFilesBatch([]accountResult{
+		{Name: "", AuthIndex: "", FileName: ""},
+	}, "x", nil, false)
+	if len(fails) != 1 || !strings.Contains(fails[0], "auth file name missing") {
+		t.Fatalf("failures = %#v", fails)
+	}
+}
+
+func TestApplyIsAsyncAndStatusStaysResponsive(t *testing.T) {
+	dir := t.TempDir()
+	setStoreFilePathForTest(dir + string(os.PathSeparator) + "results.json")
+	t.Cleanup(func() { setStoreFilePathForTest("") })
+
+	old := engine
+	engine = &inspectionEngine{
+		workers: defaultWorkers,
+		results: []accountResult{
+			{Name: "need-reauth", AuthIndex: "a1", FileName: "a1.json", Classification: "reauth", Action: "delete"},
+		},
+	}
+	t.Cleanup(func() {
+		engine.runWG.Wait()
+		engine = old
+	})
+
+	begin := time.Now()
+	if err := engine.startApply(applyRequest{
+		ForceAction: "delete",
+		AuthIndexes: []string{"a1"},
+	}, "page-password", nil); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(begin) > 100*time.Millisecond {
+		t.Fatalf("startApply should return immediately, took %s", time.Since(begin))
+	}
+	snap := engine.snapshot(false)
+	if !snap.Applying {
+		t.Fatal("expected applying=true")
+	}
+	if snap.IncludeResults {
+		t.Fatal("light snapshot should set include_results=false")
+	}
+	if len(snap.Results) != 0 {
+		t.Fatalf("light snapshot should omit results, got %d", len(snap.Results))
+	}
+	// status path is pure memory and must not wait on apply/delete work
+	resp := dispatchManagement(pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/management/plugins/grok-inspection/status",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status code = %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(resp.Body), `"applying":true`) {
+		t.Fatalf("status body missing applying=true: %s", string(resp.Body))
+	}
+	engine.runWG.Wait()
 }

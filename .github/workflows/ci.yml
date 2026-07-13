@@ -1,29 +1,79 @@
 name: CI
 
+# Push / PR 后自动测试并编译多平台插件产物（无需本机安装 Go）
 on:
   push:
+    branches:
+      - "**"
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-and-build:
-    runs-on: ubuntu-latest
+    name: Test & Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            ext: so
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+            ext: dll
+          - goos: darwin
+            goarch: arm64
+            # Pin to macos-15; macos-latest will move to macOS 26 in 2026.
+            runner: macos-15
+            ext: dylib
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          go-version: "1.21.x"
+          go-version: "1.22.x"
+          # Module has no external deps / no go.sum; disable cache to avoid warnings.
           cache: false
+
+      - name: Install Linux C toolchain
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
       - name: Test
+        shell: bash
         run: go test ./... -count=1
-      - name: Build Linux plugin
+
+      - name: Build plugin (c-shared)
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
         run: |
           mkdir -p dist
-          CGO_ENABLED=1 go build \
+          go build \
             -buildvcs=false \
             -buildmode=c-shared \
-            -o dist/grok-inspection.so \
+            -o "dist/grok-inspection.${{ matrix.ext }}" \
             .
-      - uses: actions/upload-artifact@v4
+          ls -la dist
+
+      # GitHub 下载 artifact 时本身就会再打一层 zip。
+      # 这里只上传插件本体，避免「解压后里面还有一个 zip」的套娃。
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: grok-inspection-linux-amd64
-          path: dist/grok-inspection.so
+          name: grok-inspection-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/grok-inspection.${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 30

@@ -12,7 +12,7 @@ import (
 
 const (
 	pluginName            = "grok-inspection"
-	pluginVersion         = "0.1.3"
+	pluginVersion         = "0.1.10"
 	resourceContentType   = "text/html; charset=utf-8"
 	jsonContentType       = "application/json; charset=utf-8"
 	managementRoutePrefix = "/plugins/" + pluginName
@@ -59,10 +59,10 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return pluginapi.ManagementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/status", Description: "Get Grok inspection status."},
-			{Method: http.MethodPost, Path: managementRoutePrefix + "/start", Description: "Start a Grok inspection job."},
+			{Method: http.MethodPost, Path: managementRoutePrefix + "/start", Description: "Start a full or incremental Grok inspection job."},
 			{Method: http.MethodPost, Path: managementRoutePrefix + "/stop", Description: "Stop the current Grok inspection job."},
-			{Method: http.MethodPost, Path: managementRoutePrefix + "/apply", Description: "Apply recommended disable/enable actions."},
-			{Method: http.MethodPost, Path: managementRoutePrefix + "/action", Description: "Disable or enable one Grok credential."},
+			{Method: http.MethodPost, Path: managementRoutePrefix + "/apply", Description: "Apply recommended disable/enable/delete actions asynchronously."},
+			{Method: http.MethodPost, Path: managementRoutePrefix + "/action", Description: "Disable, enable, or delete one Grok credential asynchronously."},
 		},
 		Resources: []pluginapi.ResourceRoute{
 			{
@@ -94,30 +94,55 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 	case method == http.MethodGet && matchesResourcePath(req.Path, "/status"):
 		return htmlResponse(http.StatusOK, renderUIPage(pluginName))
 	case method == http.MethodGet && matchesManagementPath(req.Path, "/status"):
-		return jsonResponse(http.StatusOK, engine.snapshot())
+		// Pure memory snapshot — never blocks on host or management HTTP.
+		// light=1 / include_results=0: progress meta only (cheap poll during inspect/apply).
+		return jsonResponse(http.StatusOK, engine.snapshot(statusWantsResults(req)))
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/start"):
 		var body startRequest
 		if len(req.Body) > 0 {
 			_ = json.Unmarshal(req.Body, &body)
 		}
 		if err := engine.start(body); err != nil {
-			return jsonResponse(http.StatusConflict, map[string]any{"error": err.Error()})
+			status := http.StatusConflict
+			msg := err.Error()
+			if strings.Contains(msg, "workers must") || strings.Contains(msg, "增量巡检") || strings.Contains(msg, "busy") {
+				status = http.StatusBadRequest
+				if strings.Contains(msg, "busy") || strings.Contains(msg, "already running") {
+					status = http.StatusConflict
+				}
+			}
+			return jsonResponse(status, map[string]any{"error": msg})
 		}
-		return jsonResponse(http.StatusOK, engine.snapshot())
+		return jsonResponse(http.StatusOK, engine.snapshot(true))
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/stop"):
 		engine.stop()
-		return jsonResponse(http.StatusOK, engine.snapshot())
+		return jsonResponse(http.StatusOK, engine.snapshot(false))
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/apply"):
 		var body applyRequest
 		if len(req.Body) > 0 {
 			_ = json.Unmarshal(req.Body, &body)
 		}
+		// Async: returns immediately so status/action stay responsive and delete
+		// can call management HTTP without re-entering the same request lock.
+		// Capture page Management Key for background delete/auth API calls.
 		password := resolveManagementPassword(req.Headers)
-		result, errApply := engine.applyRecommendations(body.AuthIndexes, password, req.Headers)
-		if errApply != nil {
-			return jsonResponse(http.StatusConflict, map[string]any{"error": errApply.Error()})
+		if err := engine.startApply(body, password, req.Headers); err != nil {
+			status := http.StatusConflict
+			msg := err.Error()
+			if strings.Contains(msg, "force_action") || strings.Contains(msg, "requires") || strings.Contains(msg, "no accounts") {
+				status = http.StatusBadRequest
+			}
+			return jsonResponse(status, map[string]any{"error": msg})
 		}
-		return jsonResponse(http.StatusOK, result)
+		// Slim ack — full account list is only on GET /status (include_results=1).
+		snap := engine.snapshot(false)
+		return jsonResponse(http.StatusAccepted, map[string]any{
+			"ok":          true,
+			"accepted":    true,
+			"applying":    snap.Applying,
+			"apply_total": snap.ApplyTotal,
+			"apply_done":  snap.ApplyDone,
+		})
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/action"):
 		var body actionRequest
 		if len(req.Body) > 0 {
@@ -125,28 +150,51 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 				return jsonResponse(http.StatusBadRequest, map[string]any{"error": err.Error()})
 			}
 		}
-		name := firstNonEmpty(body.Name, body.AuthIndex)
-		if name == "" {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "name or auth_index required"})
-		}
 		password := resolveManagementPassword(req.Headers)
-		var errAction error
-		if body.Delete {
-			errAction = deleteAuthFile(name, password, req.Headers)
-		} else {
-			errAction = setAuthDisabled(name, body.Disabled, password, req.Headers)
+		seq, action, err := engine.startAction(body, password, req.Headers)
+		if err != nil {
+			status := http.StatusConflict
+			if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "busy") {
+				status = http.StatusBadRequest
+				if strings.Contains(err.Error(), "busy") {
+					status = http.StatusConflict
+				}
+			}
+			return jsonResponse(status, map[string]any{"error": err.Error(), "ok": false})
 		}
-		if errAction != nil {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": errAction.Error()})
-		}
-		return jsonResponse(http.StatusOK, map[string]any{"ok": true})
+		// 202 = accepted only. Clients must poll light /status for recent_row_actions[seq].
+		return jsonResponse(http.StatusAccepted, map[string]any{
+			"ok":         true,
+			"accepted":   true,
+			"action":     action,
+			"action_seq": seq,
+			"name":       firstNonEmpty(body.Name, body.AuthIndex),
+		})
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "not found", "path": req.Path, "method": method})
 	}
 }
 
+// statusWantsResults defaults to full results; light polls pass include_results=0 or light=1.
+func statusWantsResults(req pluginapi.ManagementRequest) bool {
+	if req.Query == nil {
+		return true
+	}
+	if v := strings.TrimSpace(req.Query.Get("include_results")); v != "" {
+		return !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "no"))
+	}
+	if v := strings.TrimSpace(req.Query.Get("light")); v != "" {
+		return !(v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes"))
+	}
+	return true
+}
+
 func matchesManagementPath(path, suffix string) bool {
 	path = strings.TrimRight(strings.TrimSpace(path), "/")
+	// Strip query if a gateway put it on Path.
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
 	if !strings.HasPrefix(suffix, "/") {
 		suffix = "/" + suffix
 	}

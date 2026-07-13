@@ -36,7 +36,15 @@ func renderUIPage(pluginID string) []byte {
     .bar { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:10px; align-items:center; }
     .actions-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
     .actions-row .hint { font-size:12px; color:#64748b; }
-    .progress { min-height:20px; font-size:12px; color:#64748b; }
+    .progress { min-height:20px; font-size:12px; color:#64748b; display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:8px; max-width:100%%; }
+    .progress.live { color:#1d4ed8; font-weight:700; background:#dbeafe; border:1px solid #93c5fd; box-shadow:0 0 0 1px rgba(37,99,235,.08); }
+    .progress.live::before { content:""; width:8px; height:8px; border-radius:50%%; background:#2563eb; box-shadow:0 0 0 0 rgba(37,99,235,.55); animation:pulseDot 1.2s ease-out infinite; flex:0 0 auto; }
+    @keyframes pulseDot { 0%% { box-shadow:0 0 0 0 rgba(37,99,235,.45); } 70%% { box-shadow:0 0 0 8px rgba(37,99,235,0); } 100%% { box-shadow:0 0 0 0 rgba(37,99,235,0); } }
+    tr.row-out { opacity:0; transform:translateX(8px); transition:opacity .28s ease, transform .28s ease; }
+    tr.row-busy { opacity:.55; }
+    .row-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+    .row-actions button { height:28px; padding:0 8px; font-size:12px; }
+    .toast-ok { color:#047857; font-size:12px; margin-top:6px; }
     .modal { position:fixed; inset:0; z-index:1000; display:flex; align-items:center; justify-content:center; background:rgba(15,23,42,.45); padding:16px; }
     .modal.hidden { display:none; }
     .modal-card { width:min(440px,100%%); background:#fff; border-radius:12px; border:1px solid #e2e8f0; box-shadow:0 20px 40px rgba(15,23,42,.18); padding:18px 18px 14px; }
@@ -69,9 +77,10 @@ func renderUIPage(pluginID string) []byte {
     html, body { min-width:0; background:var(--page-bg) !important; color:var(--text) !important; }
     .grok-inspection-page { min-width:0; color:var(--text) !important; }
     .grok-inspection-page .sub,
-    .grok-inspection-page .progress,
     .grok-inspection-page .actions-row .hint,
     .grok-inspection-page .card .k { color:var(--muted) !important; }
+    .grok-inspection-page .progress { color:var(--muted) !important; }
+    .grok-inspection-page .progress.live { color:#1d4ed8 !important; background:#dbeafe !important; border-color:#93c5fd !important; }
     .grok-inspection-page .ctl,
     .grok-inspection-page button,
     .grok-inspection-page .card,
@@ -108,6 +117,8 @@ func renderUIPage(pluginID string) []byte {
       .grok-inspection-page button.danger { background:#3f1d1d !important; border-color:#7f1d1d !important; color:#fecaca !important; }
       .grok-inspection-page .badge { background:#252b63 !important; color:#c7d2fe !important; }
       .grok-inspection-page .card.active { outline-color:#60a5fa !important; }
+      .grok-inspection-page .progress.live { color:#93c5fd !important; background:#1e3a5f !important; border-color:#3b82f6 !important; }
+      .grok-inspection-page .progress.live::before { background:#60a5fa; }
     }
     @media (max-width:760px){
       body { overflow-x:hidden !important; }
@@ -150,8 +161,9 @@ func renderUIPage(pluginID string) []byte {
         <p class="sub">完整巡检清空并重测；增量巡检只测 Auth 中相对上次结果的新增账号。结果落盘本地，批量操作按当前筛选。</p>
       </div>
       <div class="controls">
-        <div class="key-row">
-          <input id="managementKey" type="password" autocomplete="current-password" placeholder="CPA Management Key">
+        <div class="key-row" id="keyRow">
+          <input id="managementKey" type="password" autocomplete="current-password" placeholder="CPA Management Key（可自动读取管理面板）">
+          <span class="hint" id="keyHint" style="font-size:12px;color:#64748b"></span>
         </div>
         <label class="ctl">并发 <input id="workers" type="number" min="1" max="16" step="1" value="6" title="1-16 的整数"></label>
         <label class="ctl"><input id="includeDisabled" type="checkbox"> 包含已禁用</label>
@@ -171,7 +183,10 @@ func renderUIPage(pluginID string) []byte {
         <button id="batchDeleteBtn" class="danger" type="button" disabled>批量删除</button>
         <span class="hint" id="exportHint">点击上方卡片切换分类；禁用/启用数量按当前分类下列表的启用/禁用状态统计</span>
       </div>
-      <div id="progress" class="progress">等待开始</div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;min-width:0;max-width:100%%">
+        <div id="progress" class="progress">等待开始</div>
+        <pre id="error" class="err" style="margin:0;max-width:min(720px,100%%);text-align:left;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word"></pre>
+      </div>
     </div>
     <div id="confirmModal" class="modal hidden" aria-hidden="true">
       <div class="modal-card" role="dialog" aria-modal="true">
@@ -197,7 +212,6 @@ func renderUIPage(pluginID string) []byte {
       <div id="empty" class="empty">请输入 CPA Management Key 后加载巡检状态</div>
       <div id="pager" class="pager"></div>
     </div>
-    <pre id="error" class="err" style="margin-top:12px"></pre>
   </div>
   <script>
   const BASE = %q;
@@ -257,8 +271,96 @@ func renderUIPage(pluginID string) []byte {
   $('onlyDisabled').checked = !!prefs.onlyDisabled;
   if ($('onlyDisabled').checked) $('includeDisabled').checked = false;
   const keyInput = $('managementKey');
-  keyInput.value = localStorage.getItem('grokInspectionManagementKey') || '';
+  const KEY_STORAGE = 'grokInspectionManagementKey';
+  // Match Cli-Proxy-API-Management-Center reversible localStorage obfuscation (enc::v1::).
+  // Not a security boundary — same algorithm the panel uses so we can reuse its saved key.
+  const PANEL_ENC_PREFIX = 'enc::v1::';
+  const PANEL_SECRET_SALT = 'cli-proxy-api-webui::secure-storage';
+  function panelKeyBytes() {
+    try {
+      return new TextEncoder().encode(PANEL_SECRET_SALT + '|' + window.location.host + '|' + navigator.userAgent);
+    } catch (_) {
+      return new TextEncoder().encode(PANEL_SECRET_SALT);
+    }
+  }
+  function deobfuscatePanelValue(payload) {
+    const raw = String(payload == null ? '' : payload);
+    if (!raw || raw.indexOf(PANEL_ENC_PREFIX) !== 0) return raw;
+    try {
+      const b64 = raw.slice(PANEL_ENC_PREFIX.length);
+      const binary = atob(b64);
+      const encrypted = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) encrypted[i] = binary.charCodeAt(i);
+      const key = panelKeyBytes();
+      const out = new Uint8Array(encrypted.length);
+      for (let i = 0; i < encrypted.length; i++) out[i] = encrypted[i] ^ key[i %% key.length];
+      return new TextDecoder().decode(out);
+    } catch (_) { return raw; }
+  }
+  function tryParseJSON(text) {
+    try { return JSON.parse(text); } catch (_) { return null; }
+  }
+  function extractKeyFromPanelStorage() {
+    try {
+      // Zustand persist key used by Management Center auth store.
+      const authRaw = localStorage.getItem('cli-proxy-auth');
+      if (authRaw) {
+        const parsed = tryParseJSON(deobfuscatePanelValue(authRaw));
+        const key = (parsed && parsed.state && parsed.state.managementKey)
+          || (parsed && parsed.managementKey)
+          || '';
+        if (String(key).trim()) return String(key).trim();
+      }
+      // Legacy plaintext / obfuscated single-key entries.
+      for (const name of ['managementKey', 'cli-proxy-management-key']) {
+        const raw = localStorage.getItem(name);
+        if (!raw) continue;
+        const plain = deobfuscatePanelValue(raw);
+        const parsed = tryParseJSON(plain);
+        if (typeof parsed === 'string' && parsed.trim()) return parsed.trim();
+        if (parsed && typeof parsed === 'object' && parsed.managementKey) {
+          return String(parsed.managementKey).trim();
+        }
+        if (plain && plain.indexOf(PANEL_ENC_PREFIX) !== 0 && plain.trim()) return plain.trim();
+      }
+    } catch (_) {}
+    return '';
+  }
+  function loadStoredManagementKey() {
+    try {
+      const own = localStorage.getItem(KEY_STORAGE) || sessionStorage.getItem(KEY_STORAGE) || '';
+      if (own && String(own).trim()) return String(own).trim();
+    } catch (_) {}
+    return extractKeyFromPanelStorage();
+  }
+  function persistManagementKey(value) {
+    const v = String(value == null ? '' : value);
+    try {
+      localStorage.setItem(KEY_STORAGE, v);
+      sessionStorage.setItem(KEY_STORAGE, v);
+    } catch (_) {}
+  }
+  let keySource = 'manual'; // panel | plugin | manual
+  const bootKey = loadStoredManagementKey();
+  keyInput.value = bootKey;
+  if (bootKey) {
+    if (extractKeyFromPanelStorage() === bootKey) keySource = 'panel';
+    else keySource = 'plugin';
+  }
+  function syncKeyHint() {
+    const hint = $('keyHint');
+    if (!hint) return;
+    if (hasManagementKey() && keySource === 'panel') {
+      hint.textContent = '已从管理面板自动读取 Key（无需手填）';
+      keyInput.placeholder = '已自动填充（可改）';
+    } else if (hasManagementKey() && keySource === 'plugin') {
+      hint.textContent = '已使用本插件本地保存的 Key';
+    } else {
+      hint.textContent = '未读到 Key：请先登录 /management.html 并勾选记住密码，或在此手动填写';
+    }
+  }
   const hasManagementKey = () => !!keyInput.value.trim();
+  const pendingOps = new Set(); // row keys currently running single-row actions
   function updateAuthState() {
     const ready = hasManagementKey();
     $('runBtn').disabled = !ready;
@@ -271,6 +373,20 @@ func renderUIPage(pluginID string) []byte {
       $('batchEnableBtn').disabled = true;
       $('batchDeleteBtn').disabled = true;
     }
+    syncKeyHint();
+  }
+  function setProgress(text, live) {
+    const el = $('progress');
+    el.textContent = text || '';
+    if (live) el.classList.add('live'); else el.classList.remove('live');
+  }
+  function showOk(msg) {
+    $('error').className = 'toast-ok';
+    $('error').textContent = msg || '';
+  }
+  function showErr(msg) {
+    $('error').className = 'err';
+    $('error').textContent = msg || '';
   }
   let confirmResolver = null;
   function closeConfirm(ok) {
@@ -306,10 +422,85 @@ func renderUIPage(pluginID string) []byte {
         incremental: !!incremental
       })});
       await refresh();
-    } catch (e) { $('error').textContent = String(e.message || e); }
+    } catch (e) { showErr(String(e.message || e)); }
   }
   function rowKey(r) {
     return r.auth_index || r.file_name || r.name || r.email || '';
+  }
+  function actionTargetName(r) {
+    // Prefer physical auth file name for CPA management delete/status APIs.
+    return r.file_name || r.name || r.auth_index || r.email || '';
+  }
+  function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+  async function waitRowOpResult(key, act, displayName, timeoutMs) {
+    const start = Date.now();
+    const needle = String(displayName || key || '');
+    while (Date.now() - start < (timeoutMs || 20000)) {
+      await refresh();
+      const rows = state.snapshot.results || [];
+      const row = rows.find((item) => rowKey(item) === key);
+      if (act === 'delete' && !row) return { ok: true };
+      if (act === 'disable' && row && row.disabled) return { ok: true };
+      if (act === 'enable' && row && !row.disabled) return { ok: true };
+      const fails = state.snapshot.apply_failures || [];
+      const hit = fails.find((f) => {
+        const s = String(f || '');
+        return (key && s.indexOf(key) >= 0) || (needle && s.indexOf(needle) >= 0);
+      });
+      if (hit) return { ok: false, error: hit };
+      await sleep(350);
+    }
+    return { ok: false, error: '操作超时，请刷新后确认是否已生效' };
+  }
+  async function runRowAction(r, act, tr) {
+    const key = rowKey(r);
+    if (!key || pendingOps.has(key)) return;
+    if (!hasManagementKey()) {
+      showErr('请先填写 CPA Management Key');
+      return;
+    }
+    const label = act === 'delete' ? '删除' : (act === 'enable' ? '启用' : '禁用');
+    if (act === 'delete') {
+      const ok = await confirmDialog('删除确认', '将删除 CPA Auth 凭证「' + (r.name || key) + '」。\n此操作不可恢复，确认继续？');
+      if (!ok) return;
+    }
+    pendingOps.add(key);
+    if (tr) tr.classList.add('row-busy');
+    render(); // reflect busy state on buttons without blocking other rows
+    try {
+      const result = await api('/action', {
+        method: 'POST',
+        body: JSON.stringify({
+          auth_index: r.auth_index || '',
+          name: actionTargetName(r),
+          disabled: act === 'disable',
+          delete: act === 'delete'
+        })
+      });
+      if (!result || result.ok === false) {
+        throw new Error((result && result.error) || (label + '失败'));
+      }
+      // Optimistic fade so the user sees immediate feedback; confirm via status poll.
+      if (act === 'delete' && tr) {
+        tr.classList.remove('row-busy');
+        tr.classList.add('row-out');
+      }
+      // Action is accepted async (avoid management re-entry deadlock); poll until CPA state matches.
+      const waited = await waitRowOpResult(key, act, r.name || actionTargetName(r), 20000);
+      if (!waited.ok) throw new Error(waited.error || (label + '失败'));
+      if (act === 'delete') {
+        showOk('删除成功：' + (r.name || key));
+      } else {
+        showOk((act === 'disable' ? '禁用成功：' : '启用成功：') + (r.name || key));
+      }
+      render();
+    } catch (e) {
+      showErr(String(e.message || e));
+      await refresh();
+    } finally {
+      pendingOps.delete(key);
+      render();
+    }
   }
   // 批量禁用：只针对当前分类下「已启用」的号；批量启用：只针对「已禁用」的号。
   function filteredRowsForAction(action) {
@@ -328,7 +519,7 @@ func renderUIPage(pluginID string) []byte {
       const tip = action === 'disable'
         ? '没有「已启用」可禁用的账号'
         : (action === 'enable' ? '没有「已禁用」可启用的账号' : '没有可操作的账号');
-      $('error').textContent = '当前分类「' + filterLabel() + '」下' + tip;
+      showErr('当前分类「' + filterLabel() + '」下' + tip);
       return;
     }
     const label = action === 'delete' ? '删除' : (action === 'enable' ? '启用' : '禁用');
@@ -338,8 +529,8 @@ func renderUIPage(pluginID string) []byte {
     const extra = action === 'delete'
       ? '将删除 CPA Auth 凭证文件，并更新本地结果 JSON。此操作不可恢复。'
       : (action === 'enable'
-        ? '将把账号写入 CPA Auth 为启用，并更新本地结果 JSON。'
-        : '将把账号写入 CPA Auth 为禁用，并更新本地结果 JSON。');
+        ? '将通过 CPA Management API 启用账号，并更新本地结果。'
+        : '将通过 CPA Management API 禁用账号，并更新本地结果。');
     const ok = await confirmDialog(
       '批量' + label + '确认',
       '当前分类：' + filterLabel() + '\n' +
@@ -350,22 +541,24 @@ func renderUIPage(pluginID string) []byte {
     );
     if (!ok) return;
     try {
-      await api('/apply', {
+      const result = await api('/apply', {
         method: 'POST',
         body: JSON.stringify({
           force_action: action,
           auth_indexes: indexes
         })
       });
+      const total = Number(result && result.apply_total || indexes.length || 0);
+      showOk('批量' + label + '已启动：共 ' + total + ' 项（后台执行，进度见上方状态）');
       await refresh();
     } catch (e) {
-      $('error').textContent = String(e.message || e);
+      showErr(String(e.message || e));
     }
   }
   async function batchExport() {
     const rows = filtered();
     if (!rows.length) {
-      $('error').textContent = '当前分类「' + filterLabel() + '」下没有可导出的数据';
+      showErr('当前分类「' + filterLabel() + '」下没有可导出的数据');
       return;
     }
     const ok = await confirmDialog(
@@ -378,11 +571,23 @@ func renderUIPage(pluginID string) []byte {
     if (!ok) return;
     exportRows('json');
   }
+  // Persist key on input (not only blur/change) so paste + click 开始 doesn't lose it next visit.
+  let keySaveTimer = null;
+  keyInput.addEventListener('input', () => {
+    keySource = 'manual';
+    updateAuthState();
+    if (keySaveTimer) clearTimeout(keySaveTimer);
+    keySaveTimer = setTimeout(() => persistManagementKey(keyInput.value), 200);
+  });
   keyInput.addEventListener('change', () => {
-    localStorage.setItem('grokInspectionManagementKey', keyInput.value);
+    keySource = 'manual';
+    persistManagementKey(keyInput.value);
     updateAuthState();
     refresh();
   });
+  // If panel key exists, keep plugin storage in sync for next standalone open.
+  if (bootKey) persistManagementKey(bootKey);
+  updateAuthState();
   const classLabel = {
     healthy: '健康', permission_denied: '权限被拒', quota_exhausted: '额度用尽',
     reauth: '需重新登录', model_unavailable: '模型不可用', probe_error: '探测异常', unknown: '未知'
@@ -446,7 +651,7 @@ func renderUIPage(pluginID string) []byte {
   function exportRows(format) {
     const rows = filtered();
     if (!rows.length) {
-      $('error').textContent = '当前筛选下没有可导出的数据';
+      showErr('当前筛选下没有可导出的数据');
       return;
     }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -516,11 +721,18 @@ func renderUIPage(pluginID string) []byte {
     } else {
       $('empty').style.display = 'none';
       tbody.innerHTML = pageRows.map((r) => {
-        const actionable = !snap.applying && (r.action === 'disable' || r.action === 'enable' || r.action === 'delete');
-        const actionBtn = actionable
-          ? '<button data-act="' + r.action + '" data-name="' + escapeHtml(r.name) + '" data-index="' + escapeHtml(r.auth_index || '') + '">' + actionLabel[r.action] + '</button>'
+        const key = rowKey(r);
+        const busy = pendingOps.has(key) || !!snap.applying;
+        const toggleAct = r.disabled ? 'enable' : 'disable';
+        const toggleLabel = r.disabled ? '启用' : '禁用';
+        // Every row always offers toggle + delete (not only classification-suggested action).
+        const actionBtns = hasManagementKey()
+          ? '<div class="row-actions">' +
+              '<button type="button" data-act="' + toggleAct + '" ' + (busy ? 'disabled' : '') + '>' + toggleLabel + '</button>' +
+              '<button type="button" class="danger" data-act="delete" ' + (busy ? 'disabled' : '') + '>删除</button>' +
+            '</div>'
           : '-';
-        return '<tr>' +
+        return '<tr data-key="' + escapeHtml(key) + '"' + (busy ? ' class="row-busy"' : '') + '>' +
           '<td>' + escapeHtml(r.name) + '</td>' +
           '<td>' + pill(r.disabled ? '已禁用' : '已启用', r.disabled ? '#b45309' : '#047857') + '</td>' +
           '<td>' + pill(classLabel[r.classification] || r.classification || '-', color[r.classification] || '#475569') + '</td>' +
@@ -528,19 +740,16 @@ func renderUIPage(pluginID string) []byte {
           '<td>' + escapeHtml(r.model || '-') + '</td>' +
           '<td>' + (actionLabel[r.action] || r.action || '-') + '</td>' +
           '<td>' + escapeHtml(r.reason || r.error_message || '-') + '</td>' +
-          '<td>' + actionBtn + '</td>' +
+          '<td>' + actionBtns + '</td>' +
         '</tr>';
       }).join('');
-      tbody.querySelectorAll('button[data-act]').forEach((btn) => btn.onclick = async () => {
-        try {
-          await api('/action', { method: 'POST', body: JSON.stringify({
-            auth_index: btn.dataset.index,
-            name: btn.dataset.name,
-            disabled: btn.dataset.act === 'disable',
-            delete: btn.dataset.act === 'delete'
-          })});
-          await refresh();
-        } catch (e) { $('error').textContent = String(e.message || e); }
+      tbody.querySelectorAll('tr[data-key]').forEach((tr) => {
+        const key = tr.getAttribute('data-key') || '';
+        const r = pageRows.find((row) => rowKey(row) === key);
+        if (!r) return;
+        tr.querySelectorAll('button[data-act]').forEach((btn) => {
+          btn.onclick = () => runRowAction(r, btn.dataset.act, tr);
+        });
       });
     }
     const from = rows.length ? start + 1 : 0;
@@ -585,18 +794,18 @@ func renderUIPage(pluginID string) []byte {
     $('batchEnableBtn').textContent = enableCount ? ('批量启用 (' + enableCount + ')') : '批量启用';
     $('batchDeleteBtn').textContent = filteredCount ? ('批量删除 (' + filteredCount + ')') : '批量删除';
     if (!hasManagementKey()) {
-      $('progress').textContent = '请输入 CPA Management Key 后加载巡检状态';
+      setProgress('请输入 CPA Management Key 后加载巡检状态', false);
     } else if (snap.applying) {
       let msg = '后台执行操作 ' + (snap.apply_done||0) + '/' + (snap.apply_total||0) + (snap.apply_current ? '：' + snap.apply_current : '');
       if ((snap.apply_failures || []).length) msg += '；失败 ' + snap.apply_failures.length;
-      $('progress').textContent = msg;
+      setProgress(msg, true);
     } else if (snap.running) {
       const mode = snap.incremental ? '增量巡检中' : '巡检中';
       const extra = snap.incremental ? '（仅新增，保留已有结果）' : '（后台继续）';
-      $('progress').textContent = mode + ' ' + (snap.done||0) + '/' + (snap.total||0) + ' · 并发 ' + (snap.workers||WORKERS_DEFAULT) + extra;
+      setProgress(mode + ' ' + (snap.done||0) + '/' + (snap.total||0) + ' · 并发 ' + (snap.workers||WORKERS_DEFAULT) + extra, true);
     } else if (snap.stopped) {
       const mode = snap.incremental ? '增量已停止' : '已停止';
-      $('progress').textContent = mode + '，本轮 ' + (snap.done||0) + (snap.total ? '/' + snap.total : '') + '，列表共 ' + ((snap.results||[]).length) + ' 个账号';
+      setProgress(mode + '，本轮 ' + (snap.done||0) + (snap.total ? '/' + snap.total : '') + '，列表共 ' + ((snap.results||[]).length) + ' 个账号', false);
     } else if ((snap.results||[]).length) {
       let msg = '巡检完成，共 ' + (snap.results||[]).length + ' 个账号';
       if (snap.incremental && (snap.done||0) >= 0 && snap.total != null) {
@@ -604,12 +813,13 @@ func renderUIPage(pluginID string) []byte {
       }
       if (snap.store_path) msg += ' · 已落盘';
       if ((snap.apply_failures || []).length) msg += ' · 上次操作失败 ' + snap.apply_failures.length + ' 条';
-      $('progress').textContent = msg;
+      setProgress(msg, false);
     } else {
-      $('progress').textContent = '等待开始';
+      setProgress('等待开始', false);
     }
     if ((snap.apply_failures || []).length && !snap.applying) {
-      $('error').textContent = (snap.apply_failures || []).join('\n');
+      // Always surface last op failures under the progress line (not below the table).
+      showErr((snap.apply_failures || []).join('\n'));
     }
   }
   let pollTimer = null;
@@ -633,7 +843,7 @@ func renderUIPage(pluginID string) []byte {
     if (!keyInput.value.trim()) {
       stopPolling();
       state.snapshot = { results: [], summary: {}, running: false, applying: false, done: 0, total: 0 };
-      $('error').textContent = '';
+      if ($('error').className === 'err') $('error').textContent = '';
       updateAuthState();
       render();
       return;
@@ -646,13 +856,14 @@ func renderUIPage(pluginID string) []byte {
         $('onlyDisabled').checked = !!data.only_disabled;
         if (data.workers) $('workers').value = String(clampWorkers(Number(data.workers) || WORKERS_DEFAULT));
       }
-      if (!(data.apply_failures || []).length) {
+      // Do not wipe success toasts; only clear stale red errors when server is clean.
+      if (!(data.apply_failures || []).length && pendingOps.size === 0 && $('error').className === 'err') {
         $('error').textContent = '';
       }
       syncPolling(data);
       render();
     } catch (e) {
-      $('error').textContent = String(e.message || e);
+      showErr(String(e.message || e));
       // Keep polling only if we still believe a job is active.
       syncPolling(state.snapshot);
     }
@@ -664,9 +875,9 @@ func renderUIPage(pluginID string) []byte {
       try {
         const n = normalizeWorkersInput(true);
         savePrefs({ workers: n });
-        $('error').textContent = '';
+        if ($('error').className === 'err') $('error').textContent = '';
       } catch (e) {
-        $('error').textContent = String(e.message || e);
+        showErr(String(e.message || e));
         $('workers').value = String(WORKERS_DEFAULT);
         savePrefs({ workers: WORKERS_DEFAULT });
       }
@@ -684,7 +895,7 @@ func renderUIPage(pluginID string) []byte {
   $('incrBtn').onclick = () => startInspection(true);
   $('stopBtn').onclick = async () => {
     try { await api('/stop', { method: 'POST', body: '{}' }); await refresh(); }
-    catch (e) { $('error').textContent = String(e.message || e); }
+    catch (e) { showErr(String(e.message || e)); }
   };
   $('applyBtn').onclick = async () => {
     const actionCount = (state.snapshot.results || []).filter((r) => r.action === 'disable' || r.action === 'enable' || r.action === 'delete').length;
@@ -698,16 +909,11 @@ func renderUIPage(pluginID string) []byte {
     try {
       const result = await api('/apply', { method: 'POST', body: '{}' });
       const total = Number(result && result.apply_total || 0);
-      const failed = Array.isArray(result && result.apply_failures) ? result.apply_failures.length : 0;
-      if (failed > 0) {
-        const details = result.apply_failures.slice(0, 5).join('；');
-        $('error').textContent = '建议操作已启动：失败 ' + failed + (details ? ('。示例：' + details) : '');
-      } else {
-        $('error').textContent = total ? ('建议操作已在后台执行：共 ' + total + ' 项') : '';
-      }
+      if (result && result.ok === false) throw new Error(result.error || '启动失败');
+      showOk(total ? ('建议操作已在后台执行：共 ' + total + ' 项') : '建议操作已启动');
       await refresh();
     }
-    catch (e) { $('error').textContent = String(e.message || e); }
+    catch (e) { showErr(String(e.message || e)); }
   };
   $('batchDisableBtn').onclick = () => batchForce('disable');
   $('batchEnableBtn').onclick = () => batchForce('enable');

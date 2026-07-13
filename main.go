@@ -12,7 +12,7 @@ import (
 
 const (
 	pluginName            = "grok-inspection"
-	pluginVersion         = "0.1.3"
+	pluginVersion         = "0.1.5"
 	resourceContentType   = "text/html; charset=utf-8"
 	jsonContentType       = "application/json; charset=utf-8"
 	managementRoutePrefix = "/plugins/" + pluginName
@@ -130,7 +130,15 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 			}
 			return jsonResponse(status, map[string]any{"error": msg})
 		}
-		return jsonResponse(http.StatusAccepted, engine.snapshot())
+		// Slim ack — full account list is only on GET /status.
+		snap := engine.snapshot()
+		return jsonResponse(http.StatusAccepted, map[string]any{
+			"ok":          true,
+			"accepted":    true,
+			"applying":    snap.Applying,
+			"apply_total": snap.ApplyTotal,
+			"apply_done":  snap.ApplyDone,
+		})
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/action"):
 		var body actionRequest
 		if len(req.Body) > 0 {
@@ -141,12 +149,26 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		password := resolveManagementPassword(req.Headers)
 		if err := engine.startAction(body, password, req.Headers); err != nil {
 			status := http.StatusConflict
-			if strings.Contains(err.Error(), "required") {
+			if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "busy") {
 				status = http.StatusBadRequest
+				if strings.Contains(err.Error(), "busy") {
+					status = http.StatusConflict
+				}
 			}
-			return jsonResponse(status, map[string]any{"error": err.Error()})
+			return jsonResponse(status, map[string]any{"error": err.Error(), "ok": false})
 		}
-		return jsonResponse(http.StatusAccepted, engine.snapshot())
+		action := "enable"
+		if body.Delete {
+			action = "delete"
+		} else if body.Disabled {
+			action = "disable"
+		}
+		return jsonResponse(http.StatusAccepted, map[string]any{
+			"ok":       true,
+			"accepted": true,
+			"action":   action,
+			"name":     firstNonEmpty(body.Name, body.AuthIndex),
+		})
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "not found", "path": req.Path, "method": method})
 	}

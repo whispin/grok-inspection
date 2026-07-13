@@ -728,48 +728,53 @@ func findAuthFile(name string) (*pluginapi.HostAuthFileEntry, error) {
 	return nil, fmt.Errorf("auth not found: %s", name)
 }
 
-// setAuthDisabled uses host.auth callbacks only — never re-enters CPA Management HTTP,
-// which would deadlock when called from management.handle.
-func setAuthDisabled(name string, disabled bool) error {
+func verifyAuthDisabled(authIndex, name string, disabled bool) error {
+	list, errList := callHostAuthList()
+	if errList != nil {
+		return errList
+	}
+	for _, file := range list.Files {
+		if file.AuthIndex == authIndex || file.Name == name || file.ID == name || file.Email == name {
+			actual := file.Disabled || isDisabledEntry(file.Disabled, file.Status)
+			if actual != disabled {
+				return fmt.Errorf("CPA state verification failed for %s: disabled=%v, expected=%v", name, actual, disabled)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("auth disappeared while verifying %s", name)
+}
+
+// setAuthDisabled toggles CPA auth via Management API PATCH /auth-files/status.
+// host.auth.save alone is NOT enough: CLIProxyAPI buildAuthFromFileData does not
+// promote JSON "disabled" onto Auth.Disabled, so the main UI stays enabled.
+// Must run outside management.handle (background goroutine) to avoid re-entry deadlock.
+func setAuthDisabled(name string, disabled bool, password string, headers http.Header) error {
 	target, errTarget := findAuthFile(name)
 	if errTarget != nil {
 		return errTarget
 	}
-	if strings.TrimSpace(target.AuthIndex) == "" {
-		return fmt.Errorf("auth_index missing for %s", name)
+	fileName := firstNonEmpty(target.Name, target.ID)
+	if strings.TrimSpace(fileName) == "" {
+		return fmt.Errorf("auth file name missing for %s", name)
 	}
-	getResult, errGet := callHost(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: target.AuthIndex})
-	if errGet != nil {
-		return errGet
-	}
-	var getResp pluginapi.HostAuthGetResponse
-	if err := json.Unmarshal(getResult, &getResp); err != nil {
-		return fmt.Errorf("decode host.auth.get: %w", err)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(getResp.JSON, &payload); err != nil {
-		return fmt.Errorf("decode auth json: %w", err)
-	}
-	payload["disabled"] = disabled
-	raw, errMarshal := json.Marshal(payload)
+	body, errMarshal := json.Marshal(map[string]any{
+		"name":     fileName,
+		"disabled": disabled,
+	})
 	if errMarshal != nil {
 		return errMarshal
 	}
-	saveName := firstNonEmpty(getResp.Name, target.Name)
-	if !strings.HasSuffix(strings.ToLower(saveName), ".json") {
-		saveName += ".json"
+	if _, _, errPatch := callCPAManagementWithAuth(http.MethodPatch, "/v0/management/auth-files/status", body, password, headers); errPatch != nil {
+		return errPatch
 	}
-	_, errSave := callHost(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
-		Name: saveName,
-		JSON: raw,
-	})
-	if errSave != nil {
-		return errSave
+	if errVerify := verifyAuthDisabled(target.AuthIndex, target.Name, disabled); errVerify != nil {
+		return errVerify
 	}
 	engine.mu.Lock()
 	for i := range engine.results {
 		item := &engine.results[i]
-		if item.AuthIndex == target.AuthIndex || item.FileName == target.Name || item.Name == name {
+		if resultMatchesTarget(*item, target, name) {
 			item.Disabled = disabled
 			if disabled && item.Action == "disable" {
 				item.Action = "keep"
@@ -1000,45 +1005,40 @@ func (e *inspectionEngine) startApply(req applyRequest, password string, headers
 }
 
 // startAction runs a single enable/disable/delete asynchronously.
+// Unlike bulk apply, it does not set applying=true so other list actions stay usable.
 func (e *inspectionEngine) startAction(req actionRequest, password string, headers http.Header) error {
 	name := firstNonEmpty(req.Name, req.AuthIndex)
 	if name == "" {
 		return fmt.Errorf("name or auth_index required")
 	}
 	e.mu.Lock()
-	if e.running || e.applying {
+	if e.running {
 		e.mu.Unlock()
-		return fmt.Errorf("busy")
+		return fmt.Errorf("busy: inspection running")
 	}
-	e.applying = true
-	e.applyDone = 0
-	e.applyTotal = 1
-	if req.Delete {
-		e.applyCurrent = "delete " + name
-	} else if req.Disabled {
-		e.applyCurrent = "disable " + name
-	} else {
-		e.applyCurrent = "enable " + name
+	if e.applying {
+		e.mu.Unlock()
+		return fmt.Errorf("busy: bulk apply in progress")
 	}
+	// Clear previous single-op failures so the UI poll can attribute new errors cleanly.
 	e.applyFailures = nil
 	e.mu.Unlock()
 
 	e.runWG.Add(1)
 	go func() {
 		defer e.runWG.Done()
+		// Brief yield so management.handle can finish before we re-enter Management HTTP.
+		time.Sleep(30 * time.Millisecond)
 		var errAction error
 		if req.Delete {
 			errAction = deleteAuthFile(name, password, headers)
 		} else {
-			errAction = setAuthDisabled(name, req.Disabled)
+			errAction = setAuthDisabled(name, req.Disabled, password, headers)
 		}
 		e.mu.Lock()
 		if errAction != nil {
 			e.applyFailures = []string{name + ": " + errAction.Error()}
 		}
-		e.applyDone = 1
-		e.applying = false
-		e.applyCurrent = ""
 		e.persistLocked()
 		e.mu.Unlock()
 	}()
@@ -1066,9 +1066,9 @@ func (e *inspectionEngine) runApply(candidates []accountResult, password string,
 		case "delete":
 			errAction = deleteAuthFile(targetName, password, headers)
 		case "disable":
-			errAction = setAuthDisabled(targetName, true)
+			errAction = setAuthDisabled(targetName, true, password, headers)
 		case "enable":
-			errAction = setAuthDisabled(targetName, false)
+			errAction = setAuthDisabled(targetName, false, password, headers)
 		default:
 			errAction = fmt.Errorf("unsupported action %q", item.Action)
 		}

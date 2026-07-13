@@ -66,11 +66,21 @@ func TestResourcePageShowsManagementKeyPrompt(t *testing.T) {
 		`const hasManagementKey = () => !!keyInput.value.trim();`,
 		`$('runBtn').disabled = !hasManagementKey() ||`,
 		`'请输入 CPA Management Key 后加载巡检状态'`,
+		`cli-proxy-auth`,
+		`extractKeyFromPanelStorage`,
+		`id="error"`,
+		`id="progress"`,
 	}
 	for _, marker := range required {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("resource page missing management-key UX marker %q", marker)
 		}
+	}
+	// Error toast should sit with progress (not only under the table).
+	progressIdx := strings.Index(page, `id="progress"`)
+	errorIdx := strings.Index(page, `id="error"`)
+	if progressIdx < 0 || errorIdx < 0 || errorIdx < progressIdx {
+		t.Fatal("error element should appear after progress in the status bar")
 	}
 }
 

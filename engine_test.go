@@ -141,6 +141,89 @@ func TestIncrementalStartRequiresExistingResults(t *testing.T) {
 	}
 }
 
+func TestStableIdentityPrefersAuthIndexNotEmail(t *testing.T) {
+	// Same email must NOT cause skip when auth_index differs (re-import new token).
+	known := knownResultKeys([]accountResult{
+		{AuthIndex: "old-ai", FileName: "a.json", Email: "same@x.com", Name: "same@x.com"},
+	})
+	// New runtime index, same email/name → not known
+	if entryIsKnown(known, pluginapi.HostAuthFileEntry{
+		AuthIndex: "new-ai",
+		Name:      "a.json",
+		Email:     "same@x.com",
+		Label:     "same@x.com",
+	}) {
+		t.Fatal("same email with different auth_index must not be treated as known")
+	}
+	// Same auth_index → known
+	if !entryIsKnown(known, pluginapi.HostAuthFileEntry{AuthIndex: "old-ai", Name: "other.json"}) {
+		t.Fatal("same auth_index should be known")
+	}
+	// No auth_index: file name+size+mtime must match
+	known2 := knownResultKeys([]accountResult{
+		{FileName: "b.json", FileSize: 10, FileModUnix: 100},
+	})
+	if !entryIsKnown(known2, pluginapi.HostAuthFileEntry{
+		Name:    "b.json",
+		Size:    10,
+		ModTime: time.Unix(100, 0),
+	}) {
+		t.Fatal("matching file fingerprint should be known")
+	}
+	if entryIsKnown(known2, pluginapi.HostAuthFileEntry{
+		Name:    "b.json",
+		Size:    11, // rewritten file
+		ModTime: time.Unix(100, 0),
+	}) {
+		t.Fatal("changed file size should force re-inspect")
+	}
+}
+
+func TestStartActionReturnsSeqAndReportsOnStatus(t *testing.T) {
+	old := engine
+	engine = &inspectionEngine{workers: defaultWorkers}
+	t.Cleanup(func() {
+		engine.runWG.Wait()
+		engine = old
+	})
+
+	// Missing password will fail delete quickly; still records recent_row_actions.
+	seq, action, err := engine.startAction(actionRequest{
+		Name:   "missing.json",
+		Delete: true,
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq == 0 || action != "delete" {
+		t.Fatalf("seq=%d action=%q", seq, action)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var found bool
+	for time.Now().Before(deadline) {
+		snap := engine.snapshot(false)
+		for _, a := range snap.RecentRowActions {
+			if a.Seq == seq {
+				found = true
+				if a.OK {
+					t.Fatal("expected failed action without management password")
+				}
+				if a.Error == "" {
+					t.Fatal("expected error text on failed action")
+				}
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("recent_row_actions never reported action_seq")
+	}
+}
+
 func TestDeleteAuthFilesBatchBuildsNamesBody(t *testing.T) {
 	// Smoke: empty input is a no-op.
 	if fails := deleteAuthFilesBatch(nil, "x", nil, false); len(fails) != 0 {

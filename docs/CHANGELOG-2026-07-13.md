@@ -179,8 +179,9 @@
 
 ## 8. 版本与后续可选优化
 
-- 插件版本号当前代码中为 **0.1.2**（以 `main.go` 为准）。  
-- 后续若账号量极大，可考虑：批量操作有限并发（如 2～4）、status 分页返回、error 文案截断等（未在今日实现）。
+- 插件版本号当前代码中为 **0.1.10**（以 `main.go` 为准；README / Release 默认 tag 已对齐）。  
+- 单行操作需轮询 light `/status` 的 `recent_row_actions` 确认完成后再改 UI（202 仅表示已接受）。  
+- 增量巡检跳过逻辑仅用 `auth_index`（优先）或 `file_id` / `file_name+size+mtime`，不再用邮箱/显示名单独匹配。
 
 ---
 

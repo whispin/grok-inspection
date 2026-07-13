@@ -432,48 +432,25 @@ func renderUIPage(pluginID string) []byte {
     return r.file_name || r.name || r.auth_index || r.email || '';
   }
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-  // After async /action accepts, UI is optimistic. Background reconcile must NOT
-  // blindly overwrite local rows while the backend is still finishing (that would
-  // flicker disabled/delete back). Only pull server state when failure is known
-  // or the expected outcome is already visible.
-  async function confirmRowOpInBackground(key, act, displayName) {
-    const needle = String(displayName || key || '');
-    const matchesFail = (fails) => (fails || []).find((f) => {
-      const s = String(f || '');
-      return (key && s.indexOf(key) >= 0) || (needle && s.indexOf(needle) >= 0);
-    });
-    const outcomeReady = (snap) => {
-      const rows = (snap && snap.results) || [];
-      const row = rows.find((item) => rowKey(item) === key);
-      if (act === 'delete') return !row;
-      if (act === 'disable') return !!(row && row.disabled);
-      if (act === 'enable') return !!(row && !row.disabled);
-      return true;
-    };
-    try {
-      for (let i = 0; i < 6; i++) {
-        await sleep(i === 0 ? 300 : 250);
-        if (pendingOps.has(key)) continue;
-        const data = await api('/status', { method: 'GET' });
-        const hit = matchesFail(data && data.apply_failures);
-        if (hit) {
-          // Failure: take server truth so optimistic UI is rolled back.
-          state.snapshot = data || state.snapshot;
-          showErr(hit);
-          render();
-          return;
-        }
-        if (outcomeReady(data)) {
-          // Success visible on server — sync (keeps counts/summary accurate).
-          state.snapshot = data || state.snapshot;
-          render();
-          return;
-        }
-        // Still in-flight: keep optimistic UI, do not replace snapshot yet.
+  // 202 Accepted ≠ success. Poll light /status for recent_row_actions[seq] (cheap, no full results).
+  async function waitRowActionConfirmed(seq, key, act, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 30000);
+    let lastErr = '';
+    while (Date.now() < deadline) {
+      const data = await api('/status?include_results=0', { method: 'GET' });
+      // Keep progress meta fresh while waiting.
+      mergeLightStatus(data);
+      const list = (data && data.recent_row_actions) || [];
+      const hit = list.find((a) => Number(a && a.seq) === Number(seq));
+      if (hit) {
+        if (hit.ok) return { ok: true, report: hit };
+        return { ok: false, error: hit.error || (act + ' failed'), report: hit };
       }
-    } catch (e) {
-      // Ignore background network blips; user can refresh manually.
+      lastErr = '仍在执行…';
+      render(); // show row-busy / 执行中
+      await sleep(200);
     }
+    return { ok: false, error: lastErr || '操作超时，请刷新后确认是否已生效' };
   }
   async function runRowAction(r, act, tr) {
     const key = rowKey(r);
@@ -489,6 +466,8 @@ func renderUIPage(pluginID string) []byte {
     }
     pendingOps.add(key);
     if (tr) tr.classList.add('row-busy');
+    showOk(label + '执行中：' + (r.name || key));
+    render();
     try {
       const result = await api('/action', {
         method: 'POST',
@@ -502,37 +481,35 @@ func renderUIPage(pluginID string) []byte {
       if (!result || result.ok === false) {
         throw new Error((result && result.error) || (label + '失败'));
       }
-      // Optimistic UI: /action is 202-accepted; do not block on backend completion.
-      if (act === 'delete') {
-        if (tr) {
-          tr.classList.remove('row-busy');
-          tr.classList.add('row-out');
-          await sleep(180);
-        }
-        state.snapshot = Object.assign({}, state.snapshot, {
-          results: (state.snapshot.results || []).filter((item) => rowKey(item) !== key)
-        });
-        showOk('已删除：' + (r.name || key));
-      } else {
-        state.snapshot = Object.assign({}, state.snapshot, {
-          results: (state.snapshot.results || []).map((item) => {
-            if (rowKey(item) !== key) return item;
-            const next = Object.assign({}, item, { disabled: act === 'disable' });
-            if (act === 'disable' && next.action === 'disable') next.action = 'keep';
-            if (act === 'enable' && next.action === 'enable') next.action = 'keep';
-            return next;
-          })
-        });
-        showOk((act === 'disable' ? '已禁用：' : '已启用：') + (r.name || key));
+      const seq = Number(result.action_seq || 0);
+      if (!seq) {
+        throw new Error('服务端未返回 action_seq，无法确认执行结果');
       }
+      // Wait for server completion via light status (not optimistic success).
+      const confirmed = await waitRowActionConfirmed(seq, key, act, 30000);
+      if (!confirmed.ok) {
+        throw new Error(confirmed.error || (label + '失败'));
+      }
+      // Confirmed success → pull full results once, then UI feedback.
+      await refresh({ light: false });
+      if (act === 'delete') {
+        // Full refresh already dropped the row; optional fade if still painted.
+        const rowEl = Array.from(document.querySelectorAll('tr[data-key]')).find((el) => el.getAttribute('data-key') === key);
+        if (rowEl) {
+          rowEl.classList.add('row-out');
+          await sleep(180);
+          render();
+        }
+        showOk('删除成功：' + (r.name || key));
+      } else {
+        showOk((act === 'disable' ? '禁用成功：' : '启用成功：') + (r.name || key));
+      }
+    } catch (e) {
+      showErr(String(e.message || e));
+      await refresh({ light: false });
+    } finally {
       pendingOps.delete(key);
       render();
-      // Background reconcile (errors only). Do not await in the click path.
-      void confirmRowOpInBackground(key, act, r.name || actionTargetName(r));
-    } catch (e) {
-      pendingOps.delete(key);
-      showErr(String(e.message || e));
-      await refresh();
     }
   }
   // 批量禁用：只针对当前分类下「已启用」的号；批量启用：只针对「已禁用」的号。

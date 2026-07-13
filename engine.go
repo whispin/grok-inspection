@@ -34,6 +34,10 @@ type accountResult struct {
 	Name           string `json:"name"`
 	FileName       string `json:"file_name,omitempty"`
 	Email          string `json:"email,omitempty"`
+	// FileID / FileModUnix / FileSize help incremental skip without relying on email/name.
+	FileID      string `json:"file_id,omitempty"`
+	FileModUnix int64  `json:"file_mod_unix,omitempty"`
+	FileSize    int64  `json:"file_size,omitempty"`
 	Disabled       bool   `json:"disabled"`
 	Classification string `json:"classification"`
 	Action         string `json:"action"`
@@ -42,6 +46,16 @@ type accountResult struct {
 	Model          string `json:"model,omitempty"`
 	ErrorCode      string `json:"error_code,omitempty"`
 	ErrorMessage   string `json:"error_message,omitempty"`
+}
+
+// rowActionReport is a lightweight completion record for single-row /action.
+// Clients poll light /status until RecentRowActions contains their action_seq.
+type rowActionReport struct {
+	Seq    uint64 `json:"seq"`
+	Key    string `json:"key,omitempty"`
+	Action string `json:"action,omitempty"` // enable | disable | delete
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
 }
 
 type jobSnapshot struct {
@@ -58,11 +72,15 @@ type jobSnapshot struct {
 	ApplyTotal      int             `json:"apply_total"`
 	ApplyCurrent    string          `json:"apply_current,omitempty"`
 	ApplyFailures   []string        `json:"apply_failures,omitempty"`
-	StartedAt       string          `json:"started_at,omitempty"`
-	FinishedAt      string          `json:"finished_at,omitempty"`
-	Results         []accountResult `json:"results,omitempty"`
-	Summary         map[string]int  `json:"summary"`
-	StorePath       string          `json:"store_path,omitempty"`
+	// ActionInFlight is single-row ops still running (not bulk apply).
+	ActionInFlight int `json:"action_in_flight"`
+	// RecentRowActions holds latest completed single-row ops for light confirmation.
+	RecentRowActions []rowActionReport `json:"recent_row_actions,omitempty"`
+	StartedAt        string            `json:"started_at,omitempty"`
+	FinishedAt       string            `json:"finished_at,omitempty"`
+	Results          []accountResult   `json:"results,omitempty"`
+	Summary          map[string]int    `json:"summary"`
+	StorePath        string            `json:"store_path,omitempty"`
 	// ResultsGen bumps whenever results content changes; light status omits Results.
 	ResultsGen     uint64 `json:"results_gen"`
 	IncludeResults bool   `json:"include_results"`
@@ -104,6 +122,8 @@ type inspectionEngine struct {
 	stopped         bool
 	applying        bool
 	actionInFlight  int // concurrent single-row enable/disable/delete goroutines
+	actionSeq       uint64
+	recentRowActions []rowActionReport // ring of latest completed single-row ops
 	incremental     bool
 	runID           uint64
 	workers         int
@@ -120,6 +140,8 @@ type inspectionEngine struct {
 	startedAt       time.Time
 	finishedAt      time.Time
 }
+
+const maxRecentRowActions = 32
 
 var engine = &inspectionEngine{workers: defaultWorkers}
 
@@ -231,23 +253,25 @@ func (e *inspectionEngine) snapshot(includeResults bool) jobSnapshot {
 func (e *inspectionEngine) snapshotLocked(includeResults bool) jobSnapshot {
 	summary := summarizeResults(e.results)
 	snap := jobSnapshot{
-		Running:         e.running,
-		Stopped:         e.stopped && !e.running,
-		Applying:        e.applying,
-		Incremental:     e.incremental,
-		Done:            e.probeDone,
-		Total:           e.total,
-		Workers:         e.workers,
-		IncludeDisabled: e.includeDisabled,
-		OnlyDisabled:    e.onlyDisabled,
-		ApplyDone:       e.applyDone,
-		ApplyTotal:      e.applyTotal,
-		ApplyCurrent:    e.applyCurrent,
-		ApplyFailures:   append([]string(nil), e.applyFailures...),
-		Summary:         summary,
-		StorePath:       storeFilePath(),
-		ResultsGen:      e.resultsGen,
-		IncludeResults:  includeResults,
+		Running:          e.running,
+		Stopped:          e.stopped && !e.running,
+		Applying:         e.applying,
+		Incremental:      e.incremental,
+		Done:             e.probeDone,
+		Total:            e.total,
+		Workers:          e.workers,
+		IncludeDisabled:  e.includeDisabled,
+		OnlyDisabled:     e.onlyDisabled,
+		ApplyDone:        e.applyDone,
+		ApplyTotal:       e.applyTotal,
+		ApplyCurrent:     e.applyCurrent,
+		ApplyFailures:    append([]string(nil), e.applyFailures...),
+		ActionInFlight:   e.actionInFlight,
+		RecentRowActions: append([]rowActionReport(nil), e.recentRowActions...),
+		Summary:          summary,
+		StorePath:        storeFilePath(),
+		ResultsGen:       e.resultsGen,
+		IncludeResults:   includeResults,
 	}
 	if includeResults {
 		snap.Results = append([]accountResult(nil), e.results...)
@@ -259,6 +283,22 @@ func (e *inspectionEngine) snapshotLocked(includeResults bool) jobSnapshot {
 		snap.FinishedAt = e.finishedAt.Format(time.RFC3339)
 	}
 	return snap
+}
+
+func (e *inspectionEngine) recordRowActionLocked(seq uint64, key, action string, errAction error) {
+	rep := rowActionReport{
+		Seq:    seq,
+		Key:    key,
+		Action: action,
+		OK:     errAction == nil,
+	}
+	if errAction != nil {
+		rep.Error = errAction.Error()
+	}
+	e.recentRowActions = append(e.recentRowActions, rep)
+	if len(e.recentRowActions) > maxRecentRowActions {
+		e.recentRowActions = append([]rowActionReport(nil), e.recentRowActions[len(e.recentRowActions)-maxRecentRowActions:]...)
+	}
 }
 
 func (e *inspectionEngine) start(req startRequest) error {
@@ -364,37 +404,43 @@ func (e *inspectionEngine) finish(runID uint64) {
 	e.persistLocked()
 }
 
-// knownResultKeys builds identity keys from already-inspected rows so incremental
-// mode can skip Auth accounts that appear in the last results.
+// knownResultKeys builds skip-keys for incremental inspect.
+// Prefer stable auth_index only. Never use email/display name alone (re-import
+// with a new token would incorrectly skip). Without auth_index, fall back to
+// file_name + size + mtime (or file id) so a rewritten file is re-probed.
 func knownResultKeys(results []accountResult) map[string]struct{} {
-	set := make(map[string]struct{}, len(results)*3)
+	set := make(map[string]struct{}, len(results)*2)
 	for _, item := range results {
-		for _, key := range accountIdentityKeys(item.AuthIndex, item.FileName, item.Email, item.Name) {
+		for _, key := range stableIdentityKeys(item.AuthIndex, item.FileID, item.FileName, item.FileSize, item.FileModUnix) {
 			set[key] = struct{}{}
 		}
 	}
 	return set
 }
 
-func accountIdentityKeys(authIndex, fileName, email, name string) []string {
-	keys := make([]string, 0, 4)
+func stableIdentityKeys(authIndex, fileID, fileName string, fileSize, fileModUnix int64) []string {
+	keys := make([]string, 0, 2)
 	if v := strings.TrimSpace(authIndex); v != "" {
+		// auth_index is the stable runtime credential id — preferred sole key.
 		keys = append(keys, "ai:"+v)
+		return keys
 	}
-	if v := strings.ToLower(strings.TrimSpace(fileName)); v != "" {
-		keys = append(keys, "fn:"+v)
+	if v := strings.TrimSpace(fileID); v != "" {
+		keys = append(keys, "id:"+v)
 	}
-	if v := strings.ToLower(strings.TrimSpace(email)); v != "" {
-		keys = append(keys, "em:"+v)
-	}
-	if v := strings.ToLower(strings.TrimSpace(name)); v != "" {
-		keys = append(keys, "nm:"+v)
+	fn := strings.ToLower(strings.TrimSpace(fileName))
+	if fn != "" {
+		keys = append(keys, fmt.Sprintf("fn:%s|%d|%d", fn, fileSize, fileModUnix))
 	}
 	return keys
 }
 
 func entryIsKnown(known map[string]struct{}, file pluginapi.HostAuthFileEntry) bool {
-	for _, key := range accountIdentityKeys(file.AuthIndex, file.Name, file.Email, firstNonEmpty(file.Email, file.Label, file.Name, file.AuthIndex, file.ID)) {
+	modUnix := int64(0)
+	if !file.ModTime.IsZero() {
+		modUnix = file.ModTime.Unix()
+	}
+	for _, key := range stableIdentityKeys(file.AuthIndex, file.ID, file.Name, file.Size, modUnix) {
 		if _, ok := known[key]; ok {
 			return true
 		}
@@ -494,7 +540,12 @@ func inspectAccount(file pluginapi.HostAuthFileEntry) accountResult {
 		Name:      name,
 		FileName:  file.Name,
 		Email:     file.Email,
+		FileID:    file.ID,
+		FileSize:  file.Size,
 		Disabled:  file.Disabled || isDisabledEntry(file.Disabled, file.Status),
+	}
+	if !file.ModTime.IsZero() {
+		base.FileModUnix = file.ModTime.Unix()
 	}
 	if strings.TrimSpace(file.AuthIndex) == "" {
 		base.Classification = "probe_error"
@@ -1182,22 +1233,32 @@ func (e *inspectionEngine) startApply(req applyRequest, password string, headers
 }
 
 // startAction runs a single enable/disable/delete asynchronously.
-// Unlike bulk apply, it does not set applying=true so other list rows stay clickable,
-// but actionInFlight blocks full inspect / bulk apply to avoid result races.
-func (e *inspectionEngine) startAction(req actionRequest, password string, headers http.Header) error {
+// Returns action_seq so clients can poll light /status.recent_row_actions
+// until that seq is reported — do not treat 202 alone as success.
+func (e *inspectionEngine) startAction(req actionRequest, password string, headers http.Header) (uint64, string, error) {
 	name := firstNonEmpty(req.Name, req.AuthIndex)
 	if name == "" {
-		return fmt.Errorf("name or auth_index required")
+		return 0, "", fmt.Errorf("name or auth_index required")
 	}
+	action := "enable"
+	if req.Delete {
+		action = "delete"
+	} else if req.Disabled {
+		action = "disable"
+	}
+	key := firstNonEmpty(req.AuthIndex, req.Name, name)
+
 	e.mu.Lock()
 	if e.running {
 		e.mu.Unlock()
-		return fmt.Errorf("busy: inspection running")
+		return 0, "", fmt.Errorf("busy: inspection running")
 	}
 	if e.applying {
 		e.mu.Unlock()
-		return fmt.Errorf("busy: bulk apply in progress")
+		return 0, "", fmt.Errorf("busy: bulk apply in progress")
 	}
+	e.actionSeq++
+	seq := e.actionSeq
 	e.actionInFlight++
 	password = strings.TrimSpace(password)
 	headers = cloneHTTPHeader(headers)
@@ -1220,8 +1281,9 @@ func (e *inspectionEngine) startAction(req actionRequest, password string, heade
 		if e.actionInFlight < 0 {
 			e.actionInFlight = 0
 		}
+		e.recordRowActionLocked(seq, key, action, errAction)
 		if errAction != nil {
-			// Keep a short recent failure list; do not wipe other concurrent row failures.
+			// Keep a short recent failure list for bulk-style surfaces.
 			msg := name + ": " + errAction.Error()
 			e.applyFailures = append([]string{msg}, e.applyFailures...)
 			if len(e.applyFailures) > 20 {
@@ -1232,7 +1294,7 @@ func (e *inspectionEngine) startAction(req actionRequest, password string, heade
 		// Success path already persisted inside setAuthDisabled/deleteAuthFile.
 		e.mu.Unlock()
 	}()
-	return nil
+	return seq, action, nil
 }
 
 func (e *inspectionEngine) runApply(candidates []accountResult, password string, headers http.Header) {

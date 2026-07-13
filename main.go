@@ -12,7 +12,7 @@ import (
 
 const (
 	pluginName            = "grok-inspection"
-	pluginVersion         = "0.1.9"
+	pluginVersion         = "0.1.10"
 	resourceContentType   = "text/html; charset=utf-8"
 	jsonContentType       = "application/json; charset=utf-8"
 	managementRoutePrefix = "/plugins/" + pluginName
@@ -151,7 +151,8 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 			}
 		}
 		password := resolveManagementPassword(req.Headers)
-		if err := engine.startAction(body, password, req.Headers); err != nil {
+		seq, action, err := engine.startAction(body, password, req.Headers)
+		if err != nil {
 			status := http.StatusConflict
 			if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "busy") {
 				status = http.StatusBadRequest
@@ -161,17 +162,13 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 			}
 			return jsonResponse(status, map[string]any{"error": err.Error(), "ok": false})
 		}
-		action := "enable"
-		if body.Delete {
-			action = "delete"
-		} else if body.Disabled {
-			action = "disable"
-		}
+		// 202 = accepted only. Clients must poll light /status for recent_row_actions[seq].
 		return jsonResponse(http.StatusAccepted, map[string]any{
-			"ok":       true,
-			"accepted": true,
-			"action":   action,
-			"name":     firstNonEmpty(body.Name, body.AuthIndex),
+			"ok":         true,
+			"accepted":   true,
+			"action":     action,
+			"action_seq": seq,
+			"name":       firstNonEmpty(body.Name, body.AuthIndex),
 		})
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "not found", "path": req.Path, "method": method})

@@ -2,7 +2,7 @@
 
 > Branch: `feat/inspect-improvements`  
 > Base: `ywddd/grok-inspection` `main`（`7a09872`）  
-> Plugin version: **0.1.9**
+> Plugin version: **0.1.10**
 
 ---
 
@@ -24,7 +24,7 @@
 | 能力 | 说明 |
 |------|------|
 | 完整巡检 | 清空结果后全量探测 |
-| 增量巡检 | 只测 Auth 中相对上次结果的新增账号 |
+| 增量巡检 | 只测新增账号；跳过键优先 `auth_index`，否则 `file_id` / `file+size+mtime`（不用邮箱/name 单独匹配） |
 | 并发可配 | workers 1–16，默认 6 |
 | 结果落盘 | `data/grok-inspection/results.json`（可用 `GROK_INSPECTION_DATA_DIR`） |
 | 空闲不轮询 | 仅 running/applying 时 light poll |
@@ -37,7 +37,7 @@
 | 批量启用 / 禁用 | 按当前筛选；**CPA 无批量接口**，插件侧并发 PATCH（约 6 路） |
 | 批量删除 | **走 CPA 本体** `DELETE /auth-files` 多 `names`，**每批 50** |
 | 执行建议操作 | 异步应用 classification 建议 |
-| 乐观 UI | 单行操作立刻反馈；失败后台 reconcile |
+| 单行操作确认 | 202 仅表示已接受；light `/status` 的 `recent_row_actions[action_seq]` 确认成功/失败后再改 UI |
 
 ### Management Key
 

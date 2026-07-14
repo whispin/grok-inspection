@@ -44,13 +44,16 @@ func containsAny(text string, needles ...string) bool {
 	return false
 }
 
-// isFreeUsageExhausted reports true only for Grok free-tier exhaustion signals.
+// isFreeUsageExhausted reports true only for Grok free-tier exhaustion.
+// Real example:
+//   {"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model ..."}
 // Bare HTTP 429 / generic rate-limit text must not match.
 func isFreeUsageExhausted(code, message string) bool {
 	blob := lower(code) + " " + lower(message)
+	// code already contains free-usage-exhausted for subscription:free-usage-exhausted
 	return containsAny(blob,
 		"free-usage-exhausted",
-		"subscription:free-usage-exhausted",
+		"used all the included free usage",
 		"included free usage has been exhausted",
 	)
 }

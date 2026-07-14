@@ -163,13 +163,35 @@ func TestIsFreeUsageExhaustedOnly(t *testing.T) {
 		t.Fatal("subscription free-usage-exhausted")
 	}
 	if !isFreeUsageExhausted("", "Included free usage has been exhausted") {
-		t.Fatal("official message")
+		t.Fatal("old official message")
+	}
+	if !isFreeUsageExhausted("", "You've used all the included free usage for model grok-4.5-build-free for now") {
+		t.Fatal("current official message")
 	}
 	if isFreeUsageExhausted("rate_limit", "too many requests") {
 		t.Fatal("generic rate limit must not match")
 	}
 	if isFreeUsageExhausted("", "quota exhausted") {
 		t.Fatal("bare quota exhausted must not match")
+	}
+}
+
+func TestClassifyRealGrokFreeUsagePayload(t *testing.T) {
+	body := `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 2012994/2000000. Upgrade to a Grok subscription for higher limits: https://grok.com/supergrok"}`
+	parsed := extractError(body)
+	if parsed.Code != "subscription:free-usage-exhausted" {
+		t.Fatalf("code = %q", parsed.Code)
+	}
+	if !isFreeUsageExhausted(parsed.Code, parsed.Message) {
+		t.Fatalf("should match free usage, code=%q msg=%q", parsed.Code, parsed.Message)
+	}
+	got := classifyProbe(classifyInput{
+		ChatStatus: http.StatusTooManyRequests,
+		ChatCode:   parsed.Code,
+		ChatError:  parsed.Message,
+	})
+	if got.Classification != "quota_exhausted" || got.Action != "disable" {
+		t.Fatalf("got %+v", got)
 	}
 }
 

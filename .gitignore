@@ -9,4 +9,7 @@ Thumbs.db
 .idea/
 .vscode/
 
+# runtime / local probe output
 data/
+*.tmp
+*.bak

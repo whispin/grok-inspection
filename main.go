@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"encoding/json"
@@ -242,3 +242,4 @@ func jsonResponse(statusCode int, payload any) pluginapi.ManagementResponse {
 		Body:       raw,
 	}
 }
+

@@ -1,10 +1,13 @@
-# Grok Inspection
+﻿# Grok Inspection
 
 > [中文](README.md) | **English**
 
 CPA (CLIProxyAPI) plugin for bulk xAI/Grok account health checks, with suggested disable / enable / delete actions.
 
+
 Version: `0.2.1` · Menu: **Grok Account Inspection**
+
+
 
 ## Features
 
@@ -122,3 +125,4 @@ MIT
 ## Community
 
 This open-source project is linked with and acknowledges the LINUX DO community.
+

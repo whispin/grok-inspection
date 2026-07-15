@@ -59,6 +59,8 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return pluginapi.ManagementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/status", Description: "Get Grok inspection status."},
+			{Method: http.MethodGet, Path: managementRoutePrefix + "/schedule", Description: "Get auto schedule config and runtime status."},
+			{Method: http.MethodPut, Path: managementRoutePrefix + "/schedule", Description: "Update auto schedule config and reload the scheduler."},
 			{Method: http.MethodPost, Path: managementRoutePrefix + "/start", Description: "Start a full, incremental, or classify-scoped Grok inspection job."},
 			{Method: http.MethodPost, Path: managementRoutePrefix + "/stop", Description: "Stop the current Grok inspection job."},
 			{Method: http.MethodPost, Path: managementRoutePrefix + "/apply", Description: "Apply recommended disable/enable/delete actions asynchronously."},
@@ -96,7 +98,21 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 	case method == http.MethodGet && matchesManagementPath(req.Path, "/status"):
 		// Pure memory snapshot — never blocks on host or management HTTP.
 		// light=1 / include_results=0: progress meta only (cheap poll during inspect/apply).
-		return jsonResponse(http.StatusOK, engine.snapshot(statusWantsResults(req)))
+		snap := engine.snapshot(statusWantsResults(req))
+		return jsonResponse(http.StatusOK, statusWithSchedule(snap))
+	case method == http.MethodGet && matchesManagementPath(req.Path, "/schedule"):
+		return jsonResponse(http.StatusOK, scheduler.view())
+	case method == http.MethodPut && matchesManagementPath(req.Path, "/schedule"):
+		var body scheduleConfig
+		if len(req.Body) > 0 {
+			if err := json.Unmarshal(req.Body, &body); err != nil {
+				return jsonResponse(http.StatusBadRequest, map[string]any{"error": err.Error()})
+			}
+		}
+		if err := scheduler.applyConfig(body, true); err != nil {
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": err.Error()})
+		}
+		return jsonResponse(http.StatusOK, scheduler.view())
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/start"):
 		var body startRequest
 		if len(req.Body) > 0 {

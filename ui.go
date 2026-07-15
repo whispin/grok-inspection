@@ -62,6 +62,12 @@ func renderUIPage(pluginID string) []byte {
     .err { color:#b91c1c; white-space:pre-wrap; }
     .key-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; width:100%%; }
     .key-row input { width:min(360px,100%%); height:34px; border:1px solid #cbd5e1; border-radius:8px; padding:0 10px; }
+    .schedule-panel { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:12px 14px; margin-bottom:12px; box-shadow:0 1px 2px rgba(15,23,42,.04); }
+    .schedule-panel h2 { margin:0 0 8px; font-size:14px; font-weight:700; color:#0f172a; }
+    .schedule-grid { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center; }
+    .schedule-grid label.ctl input[type=text] { width:min(180px,40vw); height:26px; border:1px solid #cbd5e1; border-radius:6px; padding:0 6px; }
+    .schedule-meta { margin-top:8px; font-size:12px; color:#64748b; line-height:1.5; }
+    .schedule-warn { margin-top:6px; font-size:12px; color:#b45309; line-height:1.45; }
     :root {
       color-scheme: light;
       --page-bg: #f5f7fb;
@@ -91,7 +97,10 @@ func renderUIPage(pluginID string) []byte {
     .grok-inspection-page button.danger { background:#fef2f2 !important; border-color:#fecaca !important; color:#b91c1c !important; }
     .grok-inspection-page .modal-msg { color:var(--text) !important; }
     .grok-inspection-page input[type=number],
+    .grok-inspection-page input[type=text],
     .grok-inspection-page .key-row input { color:var(--text) !important; background:var(--surface) !important; border-color:var(--input-border) !important; }
+    .grok-inspection-page .schedule-panel { color:var(--text) !important; background:var(--surface) !important; border-color:var(--border) !important; }
+    .grok-inspection-page .schedule-meta { color:var(--muted) !important; }
     .grok-inspection-page th { background:var(--surface-subtle) !important; color:var(--muted) !important; border-color:var(--border) !important; }
     .grok-inspection-page td { border-color:var(--border-subtle) !important; }
     .grok-inspection-page .pager { background:var(--surface-muted) !important; border-color:var(--border) !important; }
@@ -159,7 +168,7 @@ func renderUIPage(pluginID string) []byte {
       <div>
         <div class="badge">xAI / Grok · CPA Plugin</div>
         <h1>Grok 账号巡检</h1>
-        <p class="sub">完整巡检清空并重测；增量巡检只测新增账号；点上方分类卡片后可「巡检当前分类」只重测该分类。结果落盘，批量操作按当前筛选。</p>
+        <p class="sub">完整巡检清空并重测；增量巡检只测新增账号；点上方分类卡片后可「巡检当前分类」只重测该分类。结果落盘，批量操作按当前筛选。定时巡检见下方面板（默认关闭）。</p>
       </div>
       <div class="controls">
         <div class="key-row" id="keyRow">
@@ -175,6 +184,20 @@ func renderUIPage(pluginID string) []byte {
         <button id="filterRunBtn" class="soft" disabled title="只重新探测当前卡片筛选分类下的账号，保留其他结果">巡检当前分类</button>
         <button id="runBtn" class="primary">开始巡检</button>
       </div>
+    </div>
+    <div class="schedule-panel" id="schedulePanel">
+      <h2>自动定时巡检</h2>
+      <div class="schedule-grid">
+        <label class="ctl"><input id="schedEnabled" type="checkbox"> 启用定时</label>
+        <label class="ctl">Cron <input id="schedCron" type="text" value="0 3 * * *" title="5 字段：分 时 日 月 周（本地时区）" placeholder="0 3 * * *"></label>
+        <label class="ctl">定时并发 <input id="schedWorkers" type="number" min="1" max="16" step="1" value="6"></label>
+        <label class="ctl"><input id="schedAutoDeleteDenied" type="checkbox"> 自动删除权限被拒</label>
+        <label class="ctl"><input id="schedAutoDisableQuota" type="checkbox"> 自动禁用额度用尽</label>
+        <label class="ctl"><input id="schedAutoEnableHealthy" type="checkbox"> 自动启用健康已禁用</label>
+        <button id="schedSaveBtn" type="button" class="primary">保存定时配置</button>
+      </div>
+      <div class="schedule-meta" id="schedMeta">定时默认关闭。到点执行完整巡检（含已禁用）；忙碌时跳过本轮。</div>
+      <div class="schedule-warn">自动删除/禁用/启用仅在定时巡检整轮结束后执行，且依赖 CPA 进程环境变量 MANAGEMENT_PASSWORD 或 CPA_MANAGEMENT_KEY；手动巡检不会自动改账号。</div>
     </div>
     <div id="summary" class="summary"></div>
     <div class="bar">
@@ -283,7 +306,8 @@ func renderUIPage(pluginID string) []byte {
     filter: 'all',
     page: 1,
     pageSize: 20,
-    snapshot: { results: [], summary: {}, running: false, applying: false, done: 0, total: 0 }
+    snapshot: { results: [], summary: {}, running: false, applying: false, done: 0, total: 0 },
+    schedule: null
   };
   const $ = (id) => document.getElementById(id);
   const prefsKey = 'grokInspectionPrefs';
@@ -808,8 +832,74 @@ func renderUIPage(pluginID string) []byte {
     });
     downloadBlob('grok-inspection-' + tag + '-' + stamp + '.txt', lines.join('\n'), 'text/plain;charset=utf-8');
   }
+  function applyScheduleToForm(sched) {
+    if (!sched) return;
+    state.schedule = sched;
+    if ($('schedEnabled')) $('schedEnabled').checked = !!sched.enabled;
+    if ($('schedCron')) $('schedCron').value = sched.cron || '0 3 * * *';
+    if ($('schedWorkers')) $('schedWorkers').value = String(clampWorkers(Number(sched.workers) || WORKERS_DEFAULT));
+    if ($('schedAutoDeleteDenied')) $('schedAutoDeleteDenied').checked = !!sched.auto_delete_permission_denied;
+    if ($('schedAutoDisableQuota')) $('schedAutoDisableQuota').checked = !!sched.auto_disable_quota_exhausted;
+    if ($('schedAutoEnableHealthy')) $('schedAutoEnableHealthy').checked = !!sched.auto_enable_healthy_disabled;
+    renderScheduleMeta(sched);
+  }
+  function renderScheduleMeta(sched) {
+    if (!$('schedMeta') || !sched) return;
+    const parts = [];
+    parts.push(sched.enabled ? '已启用' : '已关闭');
+    if (sched.cron) parts.push('cron=' + sched.cron);
+    if (sched.next_run_at) parts.push('下次 ' + sched.next_run_at);
+    if (sched.last_run_at) parts.push('上次 ' + sched.last_run_at);
+    if (sched.last_run_status) parts.push('状态 ' + sched.last_run_status);
+    if (sched.last_skip_reason) parts.push('原因 ' + sched.last_skip_reason);
+    if ((sched.last_auto_failures || []).length) parts.push('自动处置失败 ' + sched.last_auto_failures.length + ' 条');
+    $('schedMeta').textContent = parts.join(' · ');
+  }
+  function readScheduleForm() {
+    let workers = WORKERS_DEFAULT;
+    try {
+      const raw = String($('schedWorkers').value || '').trim();
+      if (!/^\d+$/.test(raw)) throw new Error('定时并发必须是 1-16 的整数');
+      workers = clampWorkers(Number(raw));
+    } catch (e) {
+      throw e;
+    }
+    return {
+      enabled: !!$('schedEnabled').checked,
+      cron: String($('schedCron').value || '').trim(),
+      workers: workers,
+      auto_delete_permission_denied: !!$('schedAutoDeleteDenied').checked,
+      auto_disable_quota_exhausted: !!$('schedAutoDisableQuota').checked,
+      auto_enable_healthy_disabled: !!$('schedAutoEnableHealthy').checked
+    };
+  }
+  async function loadSchedule() {
+    if (!hasManagementKey()) return;
+    try {
+      const data = await api('/schedule', { method: 'GET' });
+      applyScheduleToForm(data);
+    } catch (e) {
+      // status may already carry schedule; ignore standalone load errors when idle.
+    }
+  }
+  async function saveSchedule() {
+    if (!hasManagementKey()) {
+      showErr('请先输入 CPA Management Key');
+      return;
+    }
+    try {
+      const body = readScheduleForm();
+      if (!body.cron) throw new Error('cron 不能为空');
+      const data = await api('/schedule', { method: 'PUT', body: JSON.stringify(body) });
+      applyScheduleToForm(data);
+      showOk(body.enabled ? '定时配置已保存并启用' : '定时配置已保存（未启用）');
+    } catch (e) {
+      showErr(String(e.message || e));
+    }
+  }
   function render() {
     const snap = state.snapshot || {};
+    if (snap.schedule) applyScheduleToForm(snap.schedule);
     const summary = snap.summary || {};
     const cards = [
       ['total','全部', summary.total || 0],
@@ -1089,6 +1179,7 @@ func renderUIPage(pluginID string) []byte {
   $('batchEnableBtn').onclick = () => batchForce('enable');
   $('batchDeleteBtn').onclick = () => batchForce('delete');
   $('batchExportBtn').onclick = () => batchExport();
+  if ($('schedSaveBtn')) $('schedSaveBtn').onclick = () => saveSchedule();
   $('confirmOk').onclick = () => closeConfirm(true);
   $('confirmCancel').onclick = () => closeConfirm(false);
   $('confirmModal').addEventListener('click', (ev) => {
@@ -1096,7 +1187,7 @@ func renderUIPage(pluginID string) []byte {
   });
   wireExclusive();
   // One-shot load on open; polling starts only when status reports running/applying.
-  refresh();
+  refresh().then(() => loadSchedule());
   </script>
 </body>
 </html>`, base)

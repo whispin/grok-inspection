@@ -13,3 +13,6 @@ Thumbs.db
 data/
 *.tmp
 *.bak
+/.opencode/
+/.trellis
+AGNETS.md

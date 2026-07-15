@@ -499,6 +499,124 @@ func (e *inspectionEngine) startAction(req actionRequest, password string, heade
 	return seq, action, nil
 }
 
+// runAutoActionsAfterScheduled runs only after a successful timed full inspect.
+// Order: disable quota_exhausted → enable healthy+disabled → delete permission_denied.
+// Requires MANAGEMENT_PASSWORD / CPA_MANAGEMENT_KEY; never uses page keys.
+func (e *inspectionEngine) runAutoActionsAfterScheduled(cfg scheduleConfig) {
+	needAction := cfg.AutoDeletePermissionDenied || cfg.AutoDisableQuotaExhausted || cfg.AutoEnableHealthyDisabled
+	if !needAction {
+		scheduler.recordFinished("ok", nil)
+		return
+	}
+	password := strings.TrimSpace(cpaManagementPassword())
+	if password == "" {
+		scheduler.recordFinished("auto_failed_auth", []string{"CPA management password is unavailable (set MANAGEMENT_PASSWORD on CPA process)"})
+		return
+	}
+
+	e.mu.Lock()
+	if e.running || e.applying || e.actionInFlight > 0 {
+		e.mu.Unlock()
+		scheduler.recordFinished("skipped_busy", nil)
+		return
+	}
+	results := append([]accountResult(nil), e.results...)
+	var disableTargets, enableTargets, deleteTargets []accountResult
+	for _, item := range results {
+		switch {
+		case cfg.AutoDisableQuotaExhausted && item.Classification == "quota_exhausted" && !item.Disabled:
+			copied := item
+			copied.Action = "disable"
+			disableTargets = append(disableTargets, copied)
+		case cfg.AutoEnableHealthyDisabled && item.Classification == "healthy" && item.Disabled:
+			copied := item
+			copied.Action = "enable"
+			enableTargets = append(enableTargets, copied)
+		}
+		if cfg.AutoDeletePermissionDenied && item.Classification == "permission_denied" {
+			copied := item
+			copied.Action = "delete"
+			deleteTargets = append(deleteTargets, copied)
+		}
+	}
+	total := len(disableTargets) + len(enableTargets) + len(deleteTargets)
+	if total == 0 {
+		e.mu.Unlock()
+		scheduler.recordFinished("ok", nil)
+		return
+	}
+	e.applying = true
+	e.applyDone = 0
+	e.applyTotal = total
+	e.applyCurrent = "auto actions"
+	e.applyFailures = nil
+	e.mu.Unlock()
+
+	var failures []string
+	// disable → enable → delete
+	for _, item := range disableTargets {
+		targetName := firstNonEmpty(item.FileName, item.AuthIndex, item.Name, item.Email)
+		e.mu.Lock()
+		e.applyCurrent = "auto disable " + item.Name
+		e.mu.Unlock()
+		if errAction := setAuthDisabled(targetName, true, password, nil, false); errAction != nil {
+			failures = append(failures, item.Name+": "+errAction.Error())
+		}
+		e.mu.Lock()
+		e.applyDone++
+		e.mu.Unlock()
+	}
+	for _, item := range enableTargets {
+		targetName := firstNonEmpty(item.FileName, item.AuthIndex, item.Name, item.Email)
+		e.mu.Lock()
+		e.applyCurrent = "auto enable " + item.Name
+		e.mu.Unlock()
+		if errAction := setAuthDisabled(targetName, false, password, nil, false); errAction != nil {
+			failures = append(failures, item.Name+": "+errAction.Error())
+		}
+		e.mu.Lock()
+		e.applyDone++
+		e.mu.Unlock()
+	}
+	if len(deleteTargets) > 0 {
+		for i := 0; i < len(deleteTargets); i += deleteBatchSize {
+			end := i + deleteBatchSize
+			if end > len(deleteTargets) {
+				end = len(deleteTargets)
+			}
+			chunk := deleteTargets[i:end]
+			e.mu.Lock()
+			e.applyCurrent = fmt.Sprintf("auto delete batch %d-%d/%d", i+1, end, len(deleteTargets))
+			e.mu.Unlock()
+			batchFails := deleteAuthFilesBatch(chunk, password, nil, false)
+			if len(batchFails) > 0 {
+				failures = append(failures, batchFails...)
+			}
+			e.mu.Lock()
+			e.applyDone += len(chunk)
+			e.mu.Unlock()
+		}
+	}
+
+	e.mu.Lock()
+	e.applying = false
+	e.applyCurrent = ""
+	if len(failures) > 0 {
+		e.applyFailures = append([]string(nil), failures...)
+		if len(e.applyFailures) > 20 {
+			e.applyFailures = e.applyFailures[:20]
+		}
+	}
+	e.persistLocked()
+	e.mu.Unlock()
+
+	status := "ok"
+	if len(failures) > 0 {
+		status = "auto_partial"
+	}
+	scheduler.recordFinished(status, failures)
+}
+
 func (e *inspectionEngine) runApply(candidates []accountResult, password string, headers http.Header) {
 	defer func() {
 		e.mu.Lock()

@@ -79,6 +79,14 @@ type jobSnapshot struct {
 	// ResultsGen bumps whenever results content changes; light status omits Results.
 	ResultsGen     uint64 `json:"results_gen"`
 	IncludeResults bool   `json:"include_results"`
+	// Schedule is a compact auto-schedule summary for UI without a second request.
+	Schedule *scheduleView `json:"schedule,omitempty"`
+}
+
+func statusWithSchedule(snap jobSnapshot) jobSnapshot {
+	view := scheduler.view()
+	snap.Schedule = &view
+	return snap
 }
 
 type startRequest struct {
@@ -141,9 +149,11 @@ type inspectionEngine struct {
 	startedAt       time.Time
 	finishedAt      time.Time
 	// Current-run bookkeeping for immediate stop (filled when targets are known).
-	runTargets      []pluginapi.HostAuthFileEntry
-	runModel        string
+	runTargets        []pluginapi.HostAuthFileEntry
+	runModel          string
 	runClassifyScoped bool
+	// scheduledRun is true only for cron-triggered full inspections (auto-actions).
+	scheduledRun bool
 }
 
 const maxRecentRowActions = 32
@@ -367,6 +377,7 @@ func (e *inspectionEngine) start(req startRequest) error {
 	e.running = true
 	e.stopped = false
 	e.applying = false
+	e.scheduledRun = false
 	e.runTargets = nil
 	e.runModel = ""
 	e.runClassifyScoped = false
@@ -423,6 +434,7 @@ func (e *inspectionEngine) abortRunLocked() {
 	if !e.running {
 		return
 	}
+	wasScheduled := e.scheduledRun
 	model := e.runModel
 	// Mark every not-yet-recorded target as cancelled so progress hits total now.
 	for _, file := range e.runTargets {
@@ -448,13 +460,19 @@ func (e *inspectionEngine) abortRunLocked() {
 	}
 	e.running = false
 	e.finishedAt = time.Now()
+	e.scheduledRun = false
 	e.runTargets = nil
 	e.bumpResultsLocked()
 	// Invalidate in-flight writers from this run.
 	e.runID++
+	if wasScheduled {
+		// Notify outside lock would be safer; scheduler.recordFinished only takes its own lock.
+		go scheduler.recordFinished("inspect_stopped", nil)
+	}
 }
 
 func (e *inspectionEngine) shutdown() {
+	scheduler.stop()
 	e.mu.Lock()
 	e.stopped = true
 	e.runID++
@@ -511,12 +529,17 @@ func (e *inspectionEngine) finish(runID uint64) {
 		e.mu.Unlock()
 		return
 	}
+	wasScheduled := e.scheduledRun && !e.stopped
 	e.running = false
 	e.finishedAt = time.Now()
+	e.scheduledRun = false
 	snap := e.copyPersistedLocked()
 	e.mu.Unlock()
 	// Final flush is synchronous so the last results survive process restart.
 	_ = savePersistedSnapshot(snap)
+	if wasScheduled {
+		e.runAutoActionsAfterScheduled(scheduler.configSnapshot())
+	}
 }
 
 // knownResultKeys builds skip-keys for incremental inspect.

@@ -14,6 +14,7 @@ Version: `0.1.9` · Menu: **Grok Account Inspection**
 - One-click suggested actions, bulk disable/delete, and single-account actions
 - Results are persisted and restored when you reopen the page
 - Export filtered results as JSON/TXT
+- Optional cron auto-inspection (off by default); timed path can auto-delete permission-denied, disable quota-exhausted, and enable healthy-but-disabled accounts
 
 ## Install
 
@@ -70,6 +71,27 @@ Inspection and bulk actions run in the background. Closing or switching pages do
 
 **Stop** ends the current run immediately. Accounts not yet probed are marked as stopped / not probed.
 
+## Auto scheduled inspection
+
+The **Auto scheduled inspection** panel at the bottom of the page:
+
+| Setting | Meaning |
+|---------|---------|
+| Enable | Off by default; when on, fires on cron in the process local timezone |
+| Cron | 5-field expression; default `0 3 * * *` (03:00 daily) |
+| Workers | Workers for timed full inspection (1–16, default 6) |
+| Auto-delete permission denied | After a timed full run only, delete this run's `permission_denied` |
+| Auto-disable quota exhausted | After a timed full run only, disable this run's non-disabled `quota_exhausted` |
+| Auto-enable healthy disabled | After a timed full run only, enable this run's disabled `healthy` |
+
+Rules:
+
+- Timed runs are always **full** inspections and **include disabled** accounts.
+- Auto actions run **only** on the timed path; manual full/incremental/classify runs never auto-mutate accounts.
+- Auto delete/disable/enable need process env `MANAGEMENT_PASSWORD` or `CPA_MANAGEMENT_KEY` (page key is not persisted for this).
+- If the engine is busy at fire time, the tick is **skipped**.
+- Config is stored at `data/grok-inspection/schedule.json`.
+
 ## Results
 
 | Result | Default suggestion | Meaning |
@@ -87,8 +109,10 @@ Inspection and bulk actions run in the background. Closing or switching pages do
 ## Data
 
 - Results are stored at `data/grok-inspection/results.json` under the CPA working directory
+- Schedule config is stored at `schedule.json` in the same directory
 - Result files store display fields only, not full tokens
-- The plugin never auto-disables or auto-deletes accounts; confirmation is required
+- Auto actions are off by default; when enabled, they run only after a **timed** inspection finishes
+- Manual disable/delete still requires explicit confirmation on the page
 - Delete removes the CPA auth credential; recovery requires re-login
 
 ## License
